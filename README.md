@@ -128,3 +128,8 @@ Planned improvements:
 - HTTPS support for console clients
 - richer conflict resolution UX
 - telemetry/log rotation and deeper integration tests
+
+## License
+
+This project is licensed under the `SaveSync Non-Commercial License 1.0`.
+See `LICENSE` for full terms.
