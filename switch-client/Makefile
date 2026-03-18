@@ -19,7 +19,7 @@ LIBS := -lnx
 
 APP_TITLE := SaveSync
 APP_AUTHOR := alexkirst
-APP_VERSION := 0.1.0
+APP_VERSION := 0.1.1
 
 OBJ := $(BUILD)/main.o
 

@@ -2,5 +2,10 @@
   "server_url": "http://127.0.0.1:8080",
   "api_key": "change-me",
   "delta_save_dir": "/Users/your-user/Library/Mobile Documents/com~apple~CloudDocs/Delta/Saves/GBA",
-  "poll_seconds": 30
+  "poll_seconds": 30,
+  "rom_dirs": [
+    "/Users/your-user/ROMs/GBA"
+  ],
+  "rom_map_path": "/Users/your-user/.config/savesync/rom-map.json",
+  "rom_extensions": [".gba"]
 }

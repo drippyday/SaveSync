@@ -68,6 +68,7 @@ def put_save(
     size_bytes: int = Query(...),
     filename_hint: str | None = Query(default=None),
     platform_source: str | None = Query(default=None),
+    force: bool = Query(default=False),
 ) -> JSONResponse:
     meta = SaveMeta(
         game_id=game_id,
@@ -82,7 +83,7 @@ def put_save(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="size_bytes mismatch")
 
     try:
-        effective, conflict = store.upsert(game_id, body, meta)
+        effective, conflict = store.upsert(game_id, body, meta, force=force)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 

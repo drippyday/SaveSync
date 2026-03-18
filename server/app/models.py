@@ -11,6 +11,8 @@ def utc_now_iso() -> str:
 class SaveMeta(BaseModel):
     game_id: str
     last_modified_utc: str = Field(default_factory=utc_now_iso)
+    server_updated_at: str | None = None
+    version: int = 0
     sha256: str
     size_bytes: int
     filename_hint: str | None = None
@@ -29,6 +31,8 @@ class SaveMeta(BaseModel):
 class SaveListItem(BaseModel):
     game_id: str
     last_modified_utc: str
+    server_updated_at: str | None = None
+    version: int = 0
     sha256: str
     size_bytes: int
     filename_hint: str | None = None

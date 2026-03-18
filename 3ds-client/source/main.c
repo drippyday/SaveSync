@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <malloc.h>
 #include <netdb.h>
 #include <stdbool.h>
@@ -17,11 +18,17 @@ typedef struct {
   char server_url[256];
   char api_key[128];
   char save_dir[256];
+  char sync_mode[16];
+  char vc_save_dir[256];
+  char rom_dir[256];
+  char rom_extension[16];
 } AppConfig;
 
 typedef struct {
   char game_id[128];
   char last_modified_utc[40];
+  char server_updated_at[40];
+  char sha256[65];
   char filename_hint[128];
 } RemoteSave;
 
@@ -37,20 +44,34 @@ typedef struct {
 #define MAX_SAVES 256
 #define SOC_BUFFERSIZE (0x100000)
 
+typedef enum {
+  SYNC_ACTION_AUTO = 0,
+  SYNC_ACTION_UPLOAD_ONLY = 1,
+  SYNC_ACTION_DOWNLOAD_ONLY = 2,
+} SyncAction;
+
+static void ensure_directory_exists(const char* dir);
+
 static void copy_cstr(char* dst, size_t dst_size, const char* src) {
   if (!dst || dst_size == 0) return;
   if (!src) {
     dst[0] = '\0';
     return;
   }
-  size_t n = strnlen(src, dst_size - 1);
-  memcpy(dst, src, n);
-  dst[n] = '\0';
+  size_t i = 0;
+  while (i + 1 < dst_size && src[i] != '\0') {
+    dst[i] = src[i];
+    i++;
+  }
+  dst[i] = '\0';
 }
 
 static void config_init(AppConfig* cfg) {
   memset(cfg, 0, sizeof(*cfg));
   copy_cstr(cfg->save_dir, sizeof(cfg->save_dir), "sdmc:/saves");
+  copy_cstr(cfg->sync_mode, sizeof(cfg->sync_mode), "normal");
+  copy_cstr(cfg->vc_save_dir, sizeof(cfg->vc_save_dir), "sdmc:/3ds/Checkpoint/saves");
+  copy_cstr(cfg->rom_extension, sizeof(cfg->rom_extension), ".gba");
 }
 
 static void trim_line(char* s) {
@@ -93,8 +114,16 @@ static void load_config(AppConfig* cfg, const char* path) {
       copy_cstr(cfg->server_url, sizeof(cfg->server_url), value);
     } else if (strcmp(section, "server") == 0 && strcmp(key, "api_key") == 0) {
       copy_cstr(cfg->api_key, sizeof(cfg->api_key), value);
+    } else if (strcmp(section, "sync") == 0 && strcmp(key, "mode") == 0) {
+      copy_cstr(cfg->sync_mode, sizeof(cfg->sync_mode), value);
     } else if (strcmp(section, "sync") == 0 && strcmp(key, "save_dir") == 0) {
       copy_cstr(cfg->save_dir, sizeof(cfg->save_dir), value);
+    } else if (strcmp(section, "sync") == 0 && strcmp(key, "vc_save_dir") == 0) {
+      copy_cstr(cfg->vc_save_dir, sizeof(cfg->vc_save_dir), value);
+    } else if (strcmp(section, "rom") == 0 && strcmp(key, "rom_dir") == 0) {
+      copy_cstr(cfg->rom_dir, sizeof(cfg->rom_dir), value);
+    } else if (strcmp(section, "rom") == 0 && strcmp(key, "rom_extension") == 0) {
+      copy_cstr(cfg->rom_extension, sizeof(cfg->rom_extension), value);
     }
   }
 
@@ -105,6 +134,14 @@ static bool has_sav_extension(const char* name) {
   size_t len = strlen(name);
   if (len < 4) return false;
   return strcasecmp(name + len - 4, ".sav") == 0;
+}
+
+static bool is_vc_mode(const AppConfig* cfg) {
+  return strcasecmp(cfg->sync_mode, "vc") == 0;
+}
+
+static const char* active_save_dir(const AppConfig* cfg) {
+  return is_vc_mode(cfg) ? cfg->vc_save_dir : cfg->save_dir;
 }
 
 static void sanitize_game_id(const char* in, char* out, size_t out_size) {
@@ -158,22 +195,173 @@ static bool read_file_bytes(const char* path, unsigned char** out, size_t* out_l
   return true;
 }
 
+static void decode_header_field(const unsigned char* src, size_t len, char* out, size_t out_size) {
+  size_t j = 0;
+  for (size_t i = 0; i < len && j + 1 < out_size; i++) {
+    char c = (char)src[i];
+    if (c == '\0') break;
+    if (isprint((unsigned char)c)) out[j++] = c;
+  }
+  out[j] = '\0';
+}
+
+static bool game_id_from_rom_header_bytes(const unsigned char* data, size_t len, char* out, size_t out_size) {
+  if (!data || len < 0xB0) return false;
+  char title[32] = {0};
+  char code[8] = {0};
+  char combined[64] = {0};
+  decode_header_field(data + 0xA0, 12, title, sizeof(title));
+  decode_header_field(data + 0xAC, 4, code, sizeof(code));
+  trim_line(title);
+  trim_line(code);
+  if (title[0] == '\0' && code[0] == '\0') return false;
+  if (code[0] == '\0') {
+    copy_cstr(combined, sizeof(combined), title);
+  } else {
+    snprintf(combined, sizeof(combined), "%s-%s", title, code);
+  }
+  sanitize_game_id(combined, out, out_size);
+  return out[0] != '\0';
+}
+
+static void resolve_game_id_for_save(const AppConfig* cfg, const char* save_stem, char* out, size_t out_size) {
+  if (cfg->rom_dir[0] != '\0') {
+    char ext[16];
+    copy_cstr(ext, sizeof(ext), cfg->rom_extension[0] ? cfg->rom_extension : ".gba");
+    if (ext[0] != '.') {
+      char tmp[16] = {0};
+      tmp[0] = '.';
+      copy_cstr(tmp + 1, sizeof(tmp) - 1, ext);
+      copy_cstr(ext, sizeof(ext), tmp);
+    }
+    char rom_path[640];
+    snprintf(rom_path, sizeof(rom_path), "%s/%s%s", cfg->rom_dir, save_stem, ext);
+    unsigned char* rom_bytes = NULL;
+    size_t rom_len = 0;
+    if (read_file_bytes(rom_path, &rom_bytes, &rom_len)) {
+      if (game_id_from_rom_header_bytes(rom_bytes, rom_len, out, out_size)) {
+        free(rom_bytes);
+        return;
+      }
+      free(rom_bytes);
+    }
+  }
+  sanitize_game_id(save_stem, out, out_size);
+}
+
 static bool write_atomic_file(const char* path, const unsigned char* data, size_t len) {
+  char parent_dir[512];
+  copy_cstr(parent_dir, sizeof(parent_dir), path);
+  char* slash = strrchr(parent_dir, '/');
+  if (slash) {
+    *slash = '\0';
+    ensure_directory_exists(parent_dir);
+  }
+
   char tmp_path[600];
-  snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+  unsigned long long tick = osGetTime();
+  if (slash && parent_dir[0] != '\0') {
+    snprintf(tmp_path, sizeof(tmp_path), "%s/.savesync-%llu.tmp", parent_dir, tick);
+  } else {
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+  }
   FILE* fp = fopen(tmp_path, "wb");
-  if (!fp) return false;
+  if (!fp) {
+    printf("DEBUG: fopen write failed path=%s errno=%d\n", tmp_path, errno);
+    return false;
+  }
   if (len > 0 && fwrite(data, 1, len, fp) != len) {
     fclose(fp);
+    printf("DEBUG: fwrite failed path=%s errno=%d\n", tmp_path, errno);
     remove(tmp_path);
     return false;
   }
   fclose(fp);
-  if (rename(tmp_path, path) != 0) {
+
+  // Some 3DS SD/FAT setups fail rename() replacement even when both paths exist.
+  // If destination already exists, write directly and keep temp as a rollback source.
+  struct stat dst_st;
+  bool dst_exists = (stat(path, &dst_st) == 0);
+  if (dst_exists) {
+    FILE* direct = fopen(path, "wb");
+    if (!direct) {
+      printf("DEBUG: fopen direct-existing failed path=%s errno=%d\n", path, errno);
+      remove(tmp_path);
+      return false;
+    }
+    if (len > 0 && fwrite(data, 1, len, direct) != len) {
+      printf("DEBUG: fwrite direct-existing failed path=%s errno=%d\n", path, errno);
+      fclose(direct);
+      remove(tmp_path);
+      return false;
+    }
+    fclose(direct);
     remove(tmp_path);
-    return false;
+    return true;
+  }
+
+  if (rename(tmp_path, path) != 0) {
+    int rename_errno = errno;
+    struct stat tmp_st;
+    bool tmp_exists = (stat(tmp_path, &tmp_st) == 0);
+    printf(
+        "DEBUG: rename failed from=%s to=%s errno=%d tmp_exists=%d\n",
+        tmp_path,
+        path,
+        rename_errno,
+        tmp_exists ? 1 : 0);
+    remove(path);
+    if (rename(tmp_path, path) == 0) return true;
+
+    // Fallback path for filesystems/locks where rename replacement fails.
+    FILE* direct = fopen(path, "wb");
+    if (!direct) {
+      printf("DEBUG: fopen fallback failed path=%s errno=%d\n", path, errno);
+      remove(tmp_path);
+      return false;
+    }
+    if (len > 0 && fwrite(data, 1, len, direct) != len) {
+      printf("DEBUG: fwrite fallback failed path=%s errno=%d\n", path, errno);
+      fclose(direct);
+      remove(tmp_path);
+      return false;
+    }
+    fclose(direct);
+    remove(tmp_path);
+    return true;
   }
   return true;
+}
+
+static void join_path(char* out, size_t out_size, const char* dir, const char* name) {
+  size_t len = strlen(dir);
+  bool has_trailing_slash = len > 0 && dir[len - 1] == '/';
+  snprintf(out, out_size, "%s%s%s", dir, has_trailing_slash ? "" : "/", name);
+}
+
+static void sanitize_filename(char* out, size_t out_size, const char* in, const char* fallback) {
+  if (!in || in[0] == '\0') {
+    copy_cstr(out, out_size, fallback);
+    return;
+  }
+  size_t j = 0;
+  for (size_t i = 0; in[i] != '\0' && j + 1 < out_size; i++) {
+    char c = in[i];
+    if (c == '/' || c == '\\' || c == ':') continue;
+    out[j++] = c;
+  }
+  out[j] = '\0';
+  if (out[0] == '\0') copy_cstr(out, out_size, fallback);
+}
+
+static void ensure_directory_exists(const char* dir) {
+  struct stat st;
+  if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+    return;
+  }
+  if (mkdir(dir, 0777) == 0) {
+    printf("INFO: created missing save dir: %s\n", dir);
+  }
 }
 
 static void to_hex32(unsigned int value, char* out) {
@@ -290,6 +478,16 @@ static void url_encode_simple(const char* in, char* out, size_t out_sz) {
   out[j] = '\0';
 }
 
+static bool send_all_socket(int sock_fd, const unsigned char* data, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = send(sock_fd, data + sent, len - sent, 0);
+    if (n <= 0) return false;
+    sent += (size_t)n;
+  }
+  return true;
+}
+
 static bool http_request(
     const AppConfig* cfg,
     const char* method,
@@ -338,11 +536,11 @@ static bool http_request(
     close(sock);
     return false;
   }
-  if (send(sock, req_header, (size_t)header_len, 0) < 0) {
+  if (!send_all_socket(sock, (const unsigned char*)req_header, (size_t)header_len)) {
     close(sock);
     return false;
   }
-  if (body_len > 0 && send(sock, body, body_len, 0) < 0) {
+  if (body_len > 0 && !send_all_socket(sock, body, body_len)) {
     close(sock);
     return false;
   }
@@ -425,6 +623,8 @@ static int parse_remote_saves(const char* json, RemoteSave* out, int max_items) 
     memset(&item, 0, sizeof(item));
     if (!json_extract_string(gid, "game_id", item.game_id, sizeof(item.game_id))) break;
     json_extract_string(gid, "last_modified_utc", item.last_modified_utc, sizeof(item.last_modified_utc));
+    json_extract_string(gid, "server_updated_at", item.server_updated_at, sizeof(item.server_updated_at));
+    json_extract_string(gid, "sha256", item.sha256, sizeof(item.sha256));
     json_extract_string(gid, "filename_hint", item.filename_hint, sizeof(item.filename_hint));
     out[count++] = item;
     p = gid + 10;
@@ -432,30 +632,72 @@ static int parse_remote_saves(const char* json, RemoteSave* out, int max_items) 
   return count;
 }
 
-static int scan_local_saves(const char* dir, LocalSave* out, int max_items) {
+static bool local_game_id_exists(LocalSave* local, int local_count, const char* game_id) {
+  for (int i = 0; i < local_count; i++) {
+    if (strcmp(local[i].game_id, game_id) == 0) return true;
+  }
+  return false;
+}
+
+static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* out, int max_items) {
   DIR* d = opendir(dir);
-  if (!d) return 0;
+  if (!d) {
+    printf("ERROR: cannot open save_dir: %s (errno=%d)\n", dir, errno);
+    return 0;
+  }
   int count = 0;
+  int sav_candidates = 0;
+  int read_failures = 0;
+  int stat_failures = 0;
+  int stat_fallbacks = 0;
   struct dirent* ent;
   while ((ent = readdir(d)) != NULL && count < max_items) {
     if (!has_sav_extension(ent->d_name)) continue;
+    sav_candidates++;
     LocalSave item;
     memset(&item, 0, sizeof(item));
     snprintf(item.name, sizeof(item.name), "%s", ent->d_name);
-    snprintf(item.path, sizeof(item.path), "%s/%s", dir, ent->d_name);
+    size_t dir_len = strlen(dir);
+    bool has_trailing_slash = dir_len > 0 && dir[dir_len - 1] == '/';
+    snprintf(item.path, sizeof(item.path), "%s%s%s", dir, has_trailing_slash ? "" : "/", ent->d_name);
     char stem[256];
     snprintf(stem, sizeof(stem), "%s", ent->d_name);
     char* dot = strrchr(stem, '.');
     if (dot) *dot = '\0';
-    sanitize_game_id(stem, item.game_id, sizeof(item.game_id));
+    resolve_game_id_for_save(cfg, stem, item.game_id, sizeof(item.game_id));
+    if (local_game_id_exists(out, count, item.game_id)) {
+      // Avoid local collisions when multiple ROMs share the same header ID.
+      char base_id[128];
+      sanitize_game_id(stem, base_id, sizeof(base_id));
+      if (base_id[0] == '\0') copy_cstr(base_id, sizeof(base_id), "unknown-game");
+      char base_short[120];
+      copy_cstr(base_short, sizeof(base_short), base_id);
+      copy_cstr(item.game_id, sizeof(item.game_id), base_short);
+      int suffix = 2;
+      while (local_game_id_exists(out, count, item.game_id) && suffix < 1000) {
+        snprintf(item.game_id, sizeof(item.game_id), "%s-%d", base_short, suffix++);
+      }
+    }
 
     struct stat st;
-    if (stat(item.path, &st) != 0) continue;
-    mtime_to_utc_iso(st.st_mtime, item.last_modified_utc, sizeof(item.last_modified_utc));
+    if (stat(item.path, &st) != 0) {
+      stat_failures++;
+      printf("DEBUG: stat failed path=%s errno=%d\n", item.path, errno);
+      // Some SD/FAT setups can fail stat() even when file open/read works.
+      // Fall back to current time so valid save files are still usable.
+      mtime_to_utc_iso(time(NULL), item.last_modified_utc, sizeof(item.last_modified_utc));
+      stat_fallbacks++;
+    } else {
+      mtime_to_utc_iso(st.st_mtime, item.last_modified_utc, sizeof(item.last_modified_utc));
+    }
 
     unsigned char* bytes = NULL;
     size_t len = 0;
-    if (!read_file_bytes(item.path, &bytes, &len)) continue;
+    if (!read_file_bytes(item.path, &bytes, &len)) {
+      read_failures++;
+      printf("DEBUG: read failed path=%s errno=%d\n", item.path, errno);
+      continue;
+    }
     item.size_bytes = len;
     sha256_hash(bytes, len, item.sha256);
     free(bytes);
@@ -463,93 +705,118 @@ static int scan_local_saves(const char* dir, LocalSave* out, int max_items) {
     out[count++] = item;
   }
   closedir(d);
+  if (sav_candidates == 0) {
+    printf("INFO: no .sav files found in %s\n", dir);
+  } else if (count == 0) {
+    printf(
+        "INFO: found %d .sav candidate(s), but none usable (stat_fail=%d read_fail=%d)\n",
+        sav_candidates,
+        stat_failures,
+        read_failures);
+  } else if (stat_fallbacks > 0) {
+    printf("INFO: stat fallback used for %d save(s)\n", stat_fallbacks);
+  }
   return count;
 }
 
-static int find_remote_by_id(RemoteSave* remote, int remote_count, const char* game_id) {
-  for (int i = 0; i < remote_count; i++) {
-    if (strcmp(remote[i].game_id, game_id) == 0) return i;
-  }
-  return -1;
-}
-
-static int find_local_by_id(LocalSave* local, int local_count, const char* game_id) {
-  for (int i = 0; i < local_count; i++) {
-    if (strcmp(local[i].game_id, game_id) == 0) return i;
-  }
-  return -1;
-}
-
-static void run_sync(const AppConfig* cfg) {
+static void run_sync(const AppConfig* cfg, SyncAction action) {
   printf("Scanning local saves...\n");
-  LocalSave local[MAX_SAVES];
-  RemoteSave remote[MAX_SAVES];
-  int local_count = scan_local_saves(cfg->save_dir, local, MAX_SAVES);
+  LocalSave* local = (LocalSave*)calloc(MAX_SAVES, sizeof(LocalSave));
+  RemoteSave* remote = (RemoteSave*)calloc(MAX_SAVES, sizeof(RemoteSave));
+  if (!local || !remote) {
+    printf("ERROR: out of memory for sync buffers\n");
+    free(local);
+    free(remote);
+    return;
+  }
+  const char* save_dir = active_save_dir(cfg);
+  const char* source_tag = is_vc_mode(cfg) ? "3ds-homebrew-vc" : "3ds-homebrew";
+  ensure_directory_exists(save_dir);
+  int local_count = scan_local_saves(cfg, save_dir, local, MAX_SAVES);
   printf("Local saves: %d\n", local_count);
 
   int status = 0;
   unsigned char* body = NULL;
   size_t body_len = 0;
   if (!http_request(cfg, "GET", "/saves", NULL, 0, &status, &body, &body_len) || status != 200) {
-    printf("ERROR: failed GET /saves\n");
+    printf("ERROR: failed GET /saves (check server URL/API key/network)\n");
     free(body);
+    free(local);
+    free(remote);
     return;
   }
   int remote_count = parse_remote_saves((const char*)body, remote, MAX_SAVES);
   free(body);
   printf("Remote saves: %d\n", remote_count);
 
-  for (int i = 0; i < local_count; i++) {
-    int r = find_remote_by_id(remote, remote_count, local[i].game_id);
-    if (r >= 0 && strcmp(local[i].last_modified_utc, remote[r].last_modified_utc) <= 0) {
-      printf("%s: OK\n", local[i].game_id);
-      continue;
-    }
-    unsigned char* bytes = NULL;
-    size_t len = 0;
-    if (!read_file_bytes(local[i].path, &bytes, &len)) {
-      printf("%s: ERROR(read)\n", local[i].game_id);
-      continue;
-    }
-    char ts_q[80], hash_q[80], filename_q[400], path[1024];
-    url_encode_simple(local[i].last_modified_utc, ts_q, sizeof(ts_q));
-    url_encode_simple(local[i].sha256, hash_q, sizeof(hash_q));
-    url_encode_simple(local[i].name, filename_q, sizeof(filename_q));
-    snprintf(
-        path,
-        sizeof(path),
-        "/save/%s?last_modified_utc=%s&sha256=%s&size_bytes=%zu&filename_hint=%s&platform_source=3ds-homebrew",
-        local[i].game_id,
-        ts_q,
-        hash_q,
-        local[i].size_bytes,
-        filename_q);
-    unsigned char* put_resp = NULL;
-    size_t put_len = 0;
-    int put_status = 0;
-    bool ok = http_request(cfg, "PUT", path, bytes, len, &put_status, &put_resp, &put_len);
-    free(bytes);
-    free(put_resp);
-    if (ok && put_status == 200) {
-      printf("%s: UPLOADED\n", local[i].game_id);
-    } else {
-      printf("%s: ERROR(upload)\n", local[i].game_id);
+  if (action != SYNC_ACTION_DOWNLOAD_ONLY) {
+    for (int i = 0; i < local_count; i++) {
+      unsigned char* bytes = NULL;
+      size_t len = 0;
+      if (!read_file_bytes(local[i].path, &bytes, &len)) {
+        printf("%s: ERROR(read)\n", local[i].game_id);
+        continue;
+      }
+      char ts_q[80], hash_q[80], filename_q[400], path[1024];
+      url_encode_simple(local[i].last_modified_utc, ts_q, sizeof(ts_q));
+      url_encode_simple(local[i].sha256, hash_q, sizeof(hash_q));
+      url_encode_simple(local[i].name, filename_q, sizeof(filename_q));
+      snprintf(
+          path,
+          sizeof(path),
+          "/save/%s?last_modified_utc=%s&sha256=%s&size_bytes=%zu&filename_hint=%s&platform_source=%s%s",
+          local[i].game_id,
+          ts_q,
+          hash_q,
+          local[i].size_bytes,
+          filename_q,
+          source_tag,
+          "&force=1");
+      unsigned char* put_resp = NULL;
+      size_t put_len = 0;
+      int put_status = 0;
+      bool ok = http_request(cfg, "PUT", path, bytes, len, &put_status, &put_resp, &put_len);
+      free(bytes);
+      free(put_resp);
+      if (ok && put_status == 200) {
+        printf("%s: UPLOADED\n", local[i].game_id);
+      } else {
+        printf("%s: ERROR(upload)\n", local[i].game_id);
+      }
     }
   }
 
-  body = NULL;
-  body_len = 0;
-  if (!http_request(cfg, "GET", "/saves", NULL, 0, &status, &body, &body_len) || status != 200) {
-    printf("ERROR: failed refresh GET /saves\n");
-    free(body);
+  if (action == SYNC_ACTION_UPLOAD_ONLY) {
+    free(local);
+    free(remote);
     return;
   }
-  remote_count = parse_remote_saves((const char*)body, remote, MAX_SAVES);
-  free(body);
+
+  if (action == SYNC_ACTION_AUTO) {
+    body = NULL;
+    body_len = 0;
+    if (!http_request(cfg, "GET", "/saves", NULL, 0, &status, &body, &body_len) || status != 200) {
+      printf("ERROR: failed refresh GET /saves (check server URL/API key/network)\n");
+      free(body);
+      free(local);
+      free(remote);
+      return;
+    }
+    remote_count = parse_remote_saves((const char*)body, remote, MAX_SAVES);
+    free(body);
+  }
 
   for (int i = 0; i < remote_count; i++) {
-    int l = find_local_by_id(local, local_count, remote[i].game_id);
-    if (l >= 0 && strcmp(remote[i].last_modified_utc, local[l].last_modified_utc) <= 0) continue;
+    char filename[256];
+    char fallback_name[160];
+    snprintf(fallback_name, sizeof(fallback_name), "%.*s.sav", (int)sizeof(remote[i].game_id) - 1, remote[i].game_id);
+    if (remote[i].filename_hint[0] != '\0') {
+      sanitize_filename(filename, sizeof(filename), remote[i].filename_hint, fallback_name);
+    } else {
+      sanitize_filename(filename, sizeof(filename), fallback_name, fallback_name);
+    }
+    char out_path[512];
+    join_path(out_path, sizeof(out_path), save_dir, filename);
 
     char get_path[256];
     snprintf(get_path, sizeof(get_path), "/save/%.*s", (int)sizeof(remote[i].game_id) - 1, remote[i].game_id);
@@ -561,14 +828,6 @@ static void run_sync(const AppConfig* cfg) {
       free(save_bytes);
       continue;
     }
-    char filename[256];
-    if (remote[i].filename_hint[0] != '\0') {
-      snprintf(filename, sizeof(filename), "%.*s", (int)sizeof(remote[i].filename_hint) - 1, remote[i].filename_hint);
-    } else {
-      snprintf(filename, sizeof(filename), "%.*s.sav", (int)sizeof(remote[i].game_id) - 1, remote[i].game_id);
-    }
-    char out_path[512];
-    snprintf(out_path, sizeof(out_path), "%s/%s", cfg->save_dir, filename);
     if (write_atomic_file(out_path, save_bytes, save_len)) {
       printf("%s: DOWNLOADED\n", remote[i].game_id);
     } else {
@@ -576,6 +835,34 @@ static void run_sync(const AppConfig* cfg) {
     }
     free(save_bytes);
   }
+  free(local);
+  free(remote);
+}
+
+static bool choose_action(SyncAction* out_action) {
+  while (aptMainLoop()) {
+    hidScanInput();
+    u32 kDown = hidKeysDown();
+    if (kDown & KEY_A) {
+      *out_action = SYNC_ACTION_AUTO;
+      return true;
+    }
+    if (kDown & KEY_X) {
+      *out_action = SYNC_ACTION_UPLOAD_ONLY;
+      return true;
+    }
+    if (kDown & KEY_Y) {
+      *out_action = SYNC_ACTION_DOWNLOAD_ONLY;
+      return true;
+    }
+    if (kDown & KEY_START) {
+      return false;
+    }
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+    gspWaitForVBlank();
+  }
+  return false;
 }
 
 int main(int argc, char** argv) {
@@ -592,7 +879,8 @@ int main(int argc, char** argv) {
   printf("GBA Sync (3DS MVP)\n");
   printf("------------------\n");
   printf("Server: %s\n", cfg.server_url[0] ? cfg.server_url : "(missing config)");
-  printf("Save dir: %s\n", cfg.save_dir);
+  printf("Mode: %s\n", is_vc_mode(&cfg) ? "vc" : "normal");
+  printf("Save dir: %s\n", active_save_dir(&cfg));
 
   static u32* soc_buffer = NULL;
   soc_buffer = (u32*)memalign(0x1000, SOC_BUFFERSIZE);
@@ -609,7 +897,14 @@ int main(int argc, char** argv) {
   } else if (strncmp(cfg.server_url, "http://", 7) != 0) {
     printf("ERROR: use http:// URL for 3DS MVP\n");
   } else {
-    run_sync(&cfg);
+    printf("A: full sync   X: upload only   Y: download only\n");
+    printf("Press START to cancel.\n");
+    SyncAction action = SYNC_ACTION_AUTO;
+    if (choose_action(&action)) {
+      run_sync(&cfg, action);
+    } else {
+      printf("Cancelled.\n");
+    }
   }
   printf("\nPress START to exit.\n");
 

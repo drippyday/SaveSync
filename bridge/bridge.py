@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import threading
 import time
 from dataclasses import dataclass
@@ -17,14 +16,11 @@ import requests
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from game_id import GameIdResolver
+
 
 def utc_iso_from_mtime(mtime: float) -> str:
     return datetime.fromtimestamp(mtime, timezone.utc).replace(microsecond=0).isoformat()
-
-
-def sanitize_game_id(filename_stem: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename_stem.strip().lower())
-    return cleaned.strip("-") or "unknown-game"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -37,15 +33,23 @@ class Config:
     api_key: str
     delta_save_dir: Path
     poll_seconds: int
+    rom_dirs: list[Path]
+    rom_map_path: Path | None
+    rom_extensions: list[str]
 
     @classmethod
     def load(cls, path: Path) -> "Config":
         raw = json.loads(path.read_text(encoding="utf-8"))
+        rom_dirs = [Path(p).expanduser() for p in raw.get("rom_dirs", [])]
+        rom_map_path = Path(raw["rom_map_path"]).expanduser() if raw.get("rom_map_path") else None
         return cls(
             server_url=raw["server_url"].rstrip("/"),
             api_key=raw.get("api_key", ""),
             delta_save_dir=Path(raw["delta_save_dir"]).expanduser(),
             poll_seconds=int(raw.get("poll_seconds", 30)),
+            rom_dirs=rom_dirs,
+            rom_map_path=rom_map_path,
+            rom_extensions=raw.get("rom_extensions", [".gba"]),
         )
 
 
@@ -57,6 +61,11 @@ class SyncBridge:
         self._session = requests.Session()
         self._session.headers.update({"X-API-Key": self.cfg.api_key})
         self._lock = threading.Lock()
+        self._game_id_resolver = GameIdResolver(
+            rom_dirs=self.cfg.rom_dirs,
+            rom_map_path=self.cfg.rom_map_path,
+            rom_extensions=self.cfg.rom_extensions,
+        )
 
     def log(self, msg: str) -> None:
         print(msg, flush=True)
@@ -71,11 +80,18 @@ class SyncBridge:
         saves = resp.json().get("saves", [])
         return {item["game_id"]: item for item in saves}
 
+    @staticmethod
+    def _remote_cmp_ts(meta: dict[str, Any]) -> str:
+        server_ts = str(meta.get("server_updated_at", "") or "")
+        if server_ts:
+            return server_ts
+        return str(meta.get("last_modified_utc", ""))
+
     def _upload_file(self, path: Path) -> None:
         if path.suffix.lower() != ".sav":
             return
         data = path.read_bytes()
-        game_id = sanitize_game_id(path.stem)
+        game_id = self._game_id_resolver.resolve(path)
         mtime = path.stat().st_mtime
         last_modified_utc = utc_iso_from_mtime(mtime)
         digest = sha256_bytes(data)
@@ -115,16 +131,25 @@ class SyncBridge:
             self.cfg.delta_save_dir.mkdir(parents=True, exist_ok=True)
             remote = self._list_remote()
             local_files = sorted(self.cfg.delta_save_dir.glob("*.sav"))
-            local_by_id = {sanitize_game_id(p.stem): p for p in local_files}
+            local_by_id = {self._game_id_resolver.resolve(p): p for p in local_files}
 
             # upload local-newer or local-only
             for game_id, path in local_by_id.items():
                 local_mtime_iso = utc_iso_from_mtime(path.stat().st_mtime)
+                local_sha = sha256_bytes(path.read_bytes())
                 remote_meta = remote.get(game_id)
                 if remote_meta is None:
                     self._upload_file(path)
                     continue
-                if local_mtime_iso > remote_meta["last_modified_utc"]:
+                remote_sha = str(remote_meta.get("sha256", "") or "")
+                if remote_sha and local_sha == remote_sha:
+                    continue
+                if remote_sha:
+                    self._upload_file(path)
+                    continue
+                # Fallback path for old metadata records without sha256.
+                remote_ts = str(remote_meta.get("last_modified_utc", "") or self._remote_cmp_ts(remote_meta))
+                if local_mtime_iso > remote_ts:
                     self._upload_file(path)
 
             # download remote-only or remote-newer
@@ -135,7 +160,8 @@ class SyncBridge:
                     self._download_to_path(game_id, meta.get("filename_hint"))
                     continue
                 local_mtime_iso = utc_iso_from_mtime(local.stat().st_mtime)
-                if meta["last_modified_utc"] > local_mtime_iso:
+                remote_ts = self._remote_cmp_ts(meta)
+                if remote_ts > local_mtime_iso:
                     self._download_to_path(game_id, meta.get("filename_hint"))
 
 

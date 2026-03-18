@@ -49,17 +49,23 @@ api_key=change-me
 [sync]
 save_dir=sdmc:/roms/gba/saves
 
+[rom]
+rom_dir=sdmc:/roms/gba
+rom_extension=.gba
+
 Run:
 1) Launch Homebrew Menu
 2) Start gbasync
-3) Read status lines (UPLOADED, DOWNLOADED, OK, ERROR)
-4) Press + to exit
+3) A = full sync (upload-all then download-all)
+4) X = upload-only (force overwrite to server)
+5) Y = download-only (overwrite local from server)
+6) Press + to exit
 
 Expected status example:
 - Local saves: 3
 - Remote saves: 2
 - pokemon-emerald: UPLOADED
-- metroid-zero: OK
+- metroid-zero: DOWNLOADED
 
 Troubleshooting:
 - config path must be sdmc:/switch/gba-sync/config.ini

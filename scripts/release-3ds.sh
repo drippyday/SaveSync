@@ -55,13 +55,22 @@ url=http://192.168.1.50:8080
 api_key=change-me
 
 [sync]
+mode=normal
 save_dir=sdmc:/saves
+# when mode=vc, app uses vc_save_dir instead of save_dir
+vc_save_dir=sdmc:/3ds/Checkpoint/saves
+
+[rom]
+rom_dir=sdmc:/roms/gba
+rom_extension=.gba
 
 Run:
 1) Launch Homebrew Launcher
 2) Start gbasync
-3) Read bottom-screen sync status
-4) Press START to exit
+3) A = full sync (upload-all then download-all)
+4) X = upload-only (force overwrite to server)
+5) Y = download-only (overwrite local from server)
+6) Press START to exit
 
 Expected status example:
 - Scanning local saves...

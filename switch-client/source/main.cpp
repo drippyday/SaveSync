@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,11 +23,15 @@ struct Config {
   std::string server_url;
   std::string api_key;
   std::string save_dir = "sdmc:/roms/gba/saves";
+  std::string rom_dir;
+  std::string rom_extension = ".gba";
 };
 
 struct SaveMeta {
   std::string game_id;
   std::string last_modified_utc;
+  std::string server_updated_at;
+  std::string sha256;
   std::string filename_hint;
 };
 
@@ -37,6 +42,12 @@ struct LocalSave {
   std::string last_modified_utc;
   std::string sha256;
   size_t size_bytes = 0;
+};
+
+enum class SyncAction {
+  Auto,
+  UploadOnly,
+  DownloadOnly,
 };
 
 static std::string trim(const std::string& input) {
@@ -67,6 +78,8 @@ static Config load_config(const std::string& path) {
     if (section == "server" && key == "url") cfg.server_url = value;
     if (section == "server" && key == "api_key") cfg.api_key = value;
     if (section == "sync" && key == "save_dir") cfg.save_dir = value;
+    if (section == "rom" && key == "rom_dir") cfg.rom_dir = value;
+    if (section == "rom" && key == "rom_extension") cfg.rom_extension = value;
   }
   return cfg;
 }
@@ -102,6 +115,43 @@ static std::string file_stem(const std::string& name) {
   return (dot == std::string::npos) ? name : name.substr(0, dot);
 }
 
+static std::vector<unsigned char> read_file(const std::string& path);
+
+static std::string decode_header_field(const unsigned char* start, size_t len) {
+  std::string out;
+  out.reserve(len);
+  for (size_t i = 0; i < len; i++) {
+    char c = static_cast<char>(start[i]);
+    if (c == '\0') break;
+    if (std::isprint(static_cast<unsigned char>(c))) out.push_back(c);
+  }
+  return trim(out);
+}
+
+static std::string game_id_from_rom_header(const std::vector<unsigned char>& rom_data) {
+  if (rom_data.size() < 0xB0) return "";
+  const std::string title = decode_header_field(rom_data.data() + 0xA0, 12);
+  const std::string code = decode_header_field(rom_data.data() + 0xAC, 4);
+  if (title.empty() && code.empty()) return "";
+  const std::string combined = code.empty() ? title : (title + "-" + code);
+  return sanitize_game_id(combined);
+}
+
+static std::string resolve_game_id_for_save(const Config& cfg, const std::string& save_name) {
+  const std::string stem = file_stem(save_name);
+  if (!cfg.rom_dir.empty()) {
+    std::string ext = cfg.rom_extension.empty() ? ".gba" : cfg.rom_extension;
+    if (!ext.empty() && ext[0] != '.') ext = "." + ext;
+    const std::string rom_path = cfg.rom_dir + "/" + stem + ext;
+    const std::vector<unsigned char> rom_bytes = read_file(rom_path);
+    if (!rom_bytes.empty()) {
+      const std::string from_header = game_id_from_rom_header(rom_bytes);
+      if (!from_header.empty()) return from_header;
+    }
+  }
+  return sanitize_game_id(stem);
+}
+
 static std::vector<unsigned char> read_file(const std::string& path) {
   std::ifstream file(path, std::ios::binary);
   if (!file.good()) return {};
@@ -119,7 +169,29 @@ static bool write_atomic(const std::string& path, const std::vector<unsigned cha
   if (!file.good()) return false;
   if (!data.empty()) file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
   file.close();
-  return std::rename(tmp.c_str(), path.c_str()) == 0;
+  if (std::rename(tmp.c_str(), path.c_str()) == 0) return true;
+  std::remove(path.c_str());
+  if (std::rename(tmp.c_str(), path.c_str()) == 0) return true;
+
+  // Fallback path for filesystems/locks where rename replacement fails.
+  std::ofstream direct(path, std::ios::binary);
+  if (!direct.good()) return false;
+  if (!data.empty()) direct.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  const bool ok = direct.good();
+  direct.close();
+  std::remove(tmp.c_str());
+  return ok;
+}
+
+static std::string sanitize_filename(const std::string& input, const std::string& fallback) {
+  std::string out;
+  out.reserve(input.size());
+  for (char c : input) {
+    if (c == '/' || c == '\\' || c == ':') continue;
+    out.push_back(c);
+  }
+  if (out.empty()) return fallback;
+  return out;
 }
 
 namespace sha256_impl {
@@ -302,6 +374,18 @@ static std::map<std::string, SaveMeta> parse_saves_json(const std::string& json)
       const auto tend = json.find('"', tstart);
       if (tend != std::string::npos) meta.last_modified_utc = json.substr(tstart, tend - tstart);
     }
+    const auto su = json.find("\"server_updated_at\":\"", gend);
+    if (su != std::string::npos) {
+      const auto sstart = su + 21;
+      const auto send = json.find('"', sstart);
+      if (send != std::string::npos) meta.server_updated_at = json.substr(sstart, send - sstart);
+    }
+    const auto sh = json.find("\"sha256\":\"", gend);
+    if (sh != std::string::npos) {
+      const auto sstart = sh + 10;
+      const auto send = json.find('"', sstart);
+      if (send != std::string::npos) meta.sha256 = json.substr(sstart, send - sstart);
+    }
     const auto fh = json.find("\"filename_hint\":\"", gend);
     if (fh != std::string::npos) {
       const auto fstart = fh + 17;
@@ -322,8 +406,9 @@ static std::string mtime_to_utc_iso(time_t mtime) {
   return std::string(buf);
 }
 
-static std::vector<LocalSave> scan_local_saves(const std::string& dir) {
+static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::string& dir) {
   std::vector<LocalSave> out;
+  std::map<std::string, int> used_ids;
   DIR* d = opendir(dir.c_str());
   if (!d) return out;
   dirent* ent = nullptr;
@@ -333,7 +418,21 @@ static std::vector<LocalSave> scan_local_saves(const std::string& dir) {
     LocalSave s{};
     s.name = name;
     s.path = dir + "/" + name;
-    s.game_id = sanitize_game_id(file_stem(name));
+    const std::string resolved_id = resolve_game_id_for_save(cfg, name);
+    const std::string fallback_id = sanitize_game_id(file_stem(name));
+    std::string chosen_id = resolved_id.empty() ? fallback_id : resolved_id;
+    if (used_ids.find(chosen_id) != used_ids.end()) {
+      // Avoid local collisions when multiple ROMs share the same header ID.
+      std::string base = fallback_id.empty() ? chosen_id : fallback_id;
+      if (base.empty()) base = "unknown-game";
+      chosen_id = base;
+      int suffix = 2;
+      while (used_ids.find(chosen_id) != used_ids.end()) {
+        chosen_id = base + "-" + std::to_string(suffix++);
+      }
+    }
+    used_ids[chosen_id] = 1;
+    s.game_id = chosen_id;
     struct stat st{};
     if (stat(s.path.c_str(), &st) != 0) continue;
     s.last_modified_utc = mtime_to_utc_iso(st.st_mtime);
@@ -346,9 +445,9 @@ static std::vector<LocalSave> scan_local_saves(const std::string& dir) {
   return out;
 }
 
-static std::vector<std::string> run_sync(const Config& cfg) {
+static std::vector<std::string> run_sync(const Config& cfg, SyncAction action) {
   std::vector<std::string> logs;
-  auto local = scan_local_saves(cfg.save_dir);
+  auto local = scan_local_saves(cfg, cfg.save_dir);
   std::map<std::string, LocalSave> local_by_id;
   for (const auto& s : local) local_by_id[s.game_id] = s;
   logs.push_back("Local saves: " + std::to_string(local.size()));
@@ -356,56 +455,71 @@ static std::vector<std::string> run_sync(const Config& cfg) {
   int status = 0;
   std::vector<unsigned char> body;
   if (!http_request(cfg, "GET", "/saves", {}, status, body) || status != 200) {
-    logs.push_back("ERROR: GET /saves failed");
+    if (status == 401) {
+      logs.push_back("ERROR: GET /saves unauthorized (check api_key)");
+    } else if (status > 0) {
+      logs.push_back("ERROR: GET /saves failed (HTTP " + std::to_string(status) + ")");
+    } else {
+      logs.push_back("ERROR: GET /saves failed (network/connect)");
+    }
     return logs;
   }
   std::string json(body.begin(), body.end());
   auto remote = parse_saves_json(json);
   logs.push_back("Remote saves: " + std::to_string(remote.size()));
 
-  for (const auto& [id, l] : local_by_id) {
-    const auto it = remote.find(id);
-    if (it != remote.end() && l.last_modified_utc <= it->second.last_modified_utc) {
-      logs.push_back(id + ": OK");
-      continue;
-    }
-    const std::vector<unsigned char> bytes = read_file(l.path);
-    std::ostringstream path;
-    path << "/save/" << id
-         << "?last_modified_utc=" << url_encode_simple(l.last_modified_utc)
-         << "&sha256=" << url_encode_simple(l.sha256)
-         << "&size_bytes=" << l.size_bytes
-         << "&filename_hint=" << url_encode_simple(l.name)
-         << "&platform_source=switch-homebrew";
-    std::vector<unsigned char> put_resp;
-    int put_status = 0;
-    if (http_request(cfg, "PUT", path.str(), bytes, put_status, put_resp) && put_status == 200) {
-      logs.push_back(id + ": UPLOADED");
-    } else {
-      logs.push_back(id + ": ERROR(upload)");
+  if (action != SyncAction::DownloadOnly) {
+    for (const auto& [id, l] : local_by_id) {
+      const std::vector<unsigned char> bytes = read_file(l.path);
+      std::ostringstream path;
+      path << "/save/" << id
+           << "?last_modified_utc=" << url_encode_simple(l.last_modified_utc)
+           << "&sha256=" << url_encode_simple(l.sha256)
+           << "&size_bytes=" << l.size_bytes
+           << "&filename_hint=" << url_encode_simple(l.name)
+           << "&platform_source=switch-homebrew"
+           << "&force=1";
+      std::vector<unsigned char> put_resp;
+      int put_status = 0;
+      if (http_request(cfg, "PUT", path.str(), bytes, put_status, put_resp) && put_status == 200) {
+        logs.push_back(id + ": UPLOADED");
+      } else {
+        logs.push_back(id + ": ERROR(upload)");
+      }
     }
   }
 
-  body.clear();
-  if (!http_request(cfg, "GET", "/saves", {}, status, body) || status != 200) {
-    logs.push_back("ERROR: refresh GET /saves failed");
+  if (action == SyncAction::UploadOnly) {
     return logs;
   }
-  json.assign(body.begin(), body.end());
-  remote = parse_saves_json(json);
+
+  if (action == SyncAction::Auto) {
+    body.clear();
+    if (!http_request(cfg, "GET", "/saves", {}, status, body) || status != 200) {
+      if (status > 0) {
+        logs.push_back("ERROR: refresh GET /saves failed (HTTP " + std::to_string(status) + ")");
+      } else {
+        logs.push_back("ERROR: refresh GET /saves failed (network/connect)");
+      }
+      return logs;
+    }
+    json.assign(body.begin(), body.end());
+    remote = parse_saves_json(json);
+  }
 
   for (const auto& [id, r] : remote) {
-    const auto it = local_by_id.find(id);
-    if (it != local_by_id.end() && r.last_modified_utc <= it->second.last_modified_utc) continue;
+    std::string fallback_name = id + ".sav";
+    std::string target_name = r.filename_hint.empty() ? fallback_name : sanitize_filename(r.filename_hint, fallback_name);
+    if (!has_sav_extension(target_name)) target_name += ".sav";
+    const std::string target_path = cfg.save_dir + "/" + target_name;
+
     std::vector<unsigned char> save_data;
     int get_status = 0;
     if (!http_request(cfg, "GET", "/save/" + id, {}, get_status, save_data) || get_status != 200) {
       logs.push_back(id + ": ERROR(download)");
       continue;
     }
-    std::string target_name = r.filename_hint.empty() ? id + ".sav" : r.filename_hint;
-    if (!has_sav_extension(target_name)) target_name += ".sav";
-    if (write_atomic(cfg.save_dir + "/" + target_name, save_data)) {
+    if (write_atomic(target_path, save_data)) {
       logs.push_back(id + ": DOWNLOADED");
     } else {
       logs.push_back(id + ": ERROR(write)");
@@ -414,10 +528,35 @@ static std::vector<std::string> run_sync(const Config& cfg) {
   return logs;
 }
 
+static bool choose_action(PadState* pad, SyncAction* out_action) {
+  while (appletMainLoop()) {
+    padUpdate(pad);
+    const u64 down = padGetButtonsDown(pad);
+    if (down & HidNpadButton_A) {
+      *out_action = SyncAction::Auto;
+      return true;
+    }
+    if (down & HidNpadButton_X) {
+      *out_action = SyncAction::UploadOnly;
+      return true;
+    }
+    if (down & HidNpadButton_Y) {
+      *out_action = SyncAction::DownloadOnly;
+      return true;
+    }
+    if (down & HidNpadButton_Plus) {
+      return false;
+    }
+    consoleUpdate(NULL);
+  }
+  return false;
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
   consoleInit(NULL);
+  const Result sock_rc = socketInitializeDefault();
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   PadState pad;
   padInitializeDefault(&pad);
@@ -429,12 +568,21 @@ int main(int argc, char** argv) {
   printf("Save dir: %s\n\n", cfg.save_dir.c_str());
 
   std::vector<std::string> logs;
-  if (cfg.server_url.empty()) {
+  if (R_FAILED(sock_rc)) {
+    logs.push_back("ERROR: socket init failed");
+  } else if (cfg.server_url.empty()) {
     logs.push_back("ERROR: missing [server].url in config.ini");
   } else if (cfg.server_url.rfind("http://", 0) != 0) {
     logs.push_back("ERROR: use http:// URL for Switch MVP");
   } else {
-    logs = run_sync(cfg);
+    printf("A: full sync   X: upload only   Y: download only\n");
+    printf("Press + to cancel.\n\n");
+    SyncAction action = SyncAction::Auto;
+    if (choose_action(&pad, &action)) {
+      logs = run_sync(cfg, action);
+    } else {
+      logs.push_back("Cancelled.");
+    }
   }
   for (const auto& line : logs) printf("%s\n", line.c_str());
   printf("\nPress + to exit.\n");
@@ -445,6 +593,7 @@ int main(int argc, char** argv) {
     consoleUpdate(NULL);
   }
 
+  socketExit();
   consoleExit(NULL);
   return 0;
 }

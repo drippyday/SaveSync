@@ -15,6 +15,10 @@ def parse_utc(iso_value: str) -> datetime:
     return datetime.fromisoformat(iso_value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
 class SaveStore:
     def __init__(self, save_root: Path, history_root: Path, index_path: Path, keep_history: bool = True):
         self.save_root = save_root
@@ -79,11 +83,12 @@ class SaveStore:
         existing_file = self.save_path(game_id)
         if not existing_file.exists() or not existing_meta:
             return
-        stamp = existing_meta.last_modified_utc.replace(":", "-")
+        stamp_src = existing_meta.server_updated_at or existing_meta.last_modified_utc
+        stamp = stamp_src.replace(":", "-")
         history_path = self.history_dir(game_id) / f"{stamp}-{existing_meta.sha256[:8]}.sav"
         shutil.copy2(existing_file, history_path)
 
-    def upsert(self, game_id: str, data: bytes, incoming: SaveMeta) -> tuple[SaveMeta, bool]:
+    def upsert(self, game_id: str, data: bytes, incoming: SaveMeta, force: bool = False) -> tuple[SaveMeta, bool]:
         """
         Returns: (effective_meta, conflict_detected)
         """
@@ -98,17 +103,18 @@ class SaveStore:
             conflict = False
 
             if existing:
-                existing_time = parse_utc(existing.last_modified_utc)
-                incoming_time = parse_utc(incoming.last_modified_utc)
+                if not force:
+                    existing_time = parse_utc(existing.last_modified_utc)
+                    incoming_time = parse_utc(incoming.last_modified_utc)
 
-                # equal timestamp but different payload should be preserved as conflict.
-                if incoming_time == existing_time and existing.sha256 != incoming.sha256:
-                    conflict = True
-                    incoming.conflict = True
+                    # equal timestamp but different payload should be preserved as conflict.
+                    if incoming_time == existing_time and existing.sha256 != incoming.sha256:
+                        conflict = True
+                        incoming.conflict = True
 
-                # older upload does not replace newer remote.
-                if incoming_time < existing_time:
-                    return existing, conflict
+                    # older upload does not replace newer remote.
+                    if incoming_time < existing_time:
+                        return existing, conflict
 
                 self._backup_existing(game_id, existing)
 
@@ -117,6 +123,8 @@ class SaveStore:
             tmp.write_bytes(data)
             os.replace(tmp, target)
 
+            incoming.server_updated_at = utc_now_iso()
+            incoming.version = (existing.version + 1) if existing else 1
             index[game_id] = incoming.model_dump(exclude={"game_id"})
             self._write_index(index)
             return incoming, conflict

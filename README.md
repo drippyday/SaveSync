@@ -21,7 +21,7 @@ SaveSync uses a client-server model:
 - `switch-client/`: Switch homebrew sync app (`.nro`)
 - `3ds-client/`: 3DS homebrew sync app (`.3dsx`)
 
-Each client compares local and remote timestamps and performs upload/download as needed.
+Clients support explicit overwrite sync actions for predictable cross-device transfer.
 
 ## Current Status
 
@@ -64,10 +64,10 @@ python bridge.py --config config.json --once
 Generate release artifacts:
 
 ```bash
-./scripts/release-server.sh v0.1.0
-./scripts/release-bridge.sh v0.1.0
-./scripts/release-switch.sh v0.1.0
-./scripts/release-3ds.sh v0.1.0
+./scripts/release-server.sh v0.1.1
+./scripts/release-bridge.sh v0.1.1
+./scripts/release-switch.sh v0.1.1
+./scripts/release-3ds.sh v0.1.1
 ```
 
 Then use:
@@ -78,23 +78,38 @@ Then use:
 ## Documentation
 
 - `USER_GUIDE.md`: full setup and usage guide
+- `VC_WORKFLOW.md`: step-by-step VC inject export/sync/import guide
 - `RELEASE.md`: packaging and release workflow
 - `dist/README.md`: dist artifact glossary and install pointers
 - `server/README.md`: server API and run details
+- `docs/HARDWARE_VALIDATION_CHECKLIST.md`: real-device validation checklist
 - `PLAN.md`: implementation checklist and progress tracking
 - `IDEA.md`: project concept notes
 
+## Smoke Test Harness
+
+Run a local server+bridge smoke test:
+
+```bash
+./scripts/smoke-sync.sh
+```
+
+This verifies upload and download flow in an isolated temp directory.
+
 ## Key Behaviors
 
-- Last-write-wins based on `last_modified_utc`
+- Console uploads force-overwrite server saves (`force=1`)
+- Console downloads overwrite local save files with remote content
 - Conflict detection when hashes differ at same timestamp
 - Atomic file writes for safer save replacement
 - Optional version-history backups on server
+- Bridge supports ROM-header-based `game_id` derivation when ROM paths are configured
+- 3DS client supports `mode=normal` and `mode=vc` save source selection in config
 
 ## MVP Limitations
 
 - Switch/3DS clients currently use `http://` (no TLS path yet)
-- Game identity is filename-derived in current MVP
+- Switch/3DS game identity is filename-derived in current MVP
 - Console sync is foreground/manual (not background service)
 
 ## Toolchain Requirements (for building clients)

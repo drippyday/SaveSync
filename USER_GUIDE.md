@@ -87,7 +87,7 @@ Expected watch-mode output example:
 
 Use artifact:
 
-- `dist/switch/savesync-switch-v0.1.0/gbasync.nro`
+- `dist/switch/savesync-switch-v0.1.1/gbasync.nro`
 
 On SD card:
 
@@ -103,6 +103,10 @@ api_key=change-me
 
 [sync]
 save_dir=sdmc:/roms/gba/saves
+
+[rom]
+rom_dir=sdmc:/roms/gba
+rom_extension=.gba
 ```
 
 Launch from Homebrew Menu and press `+` to exit.
@@ -113,14 +117,14 @@ Expected in-app output example:
 Local saves: 3
 Remote saves: 2
 pokemon-emerald: UPLOADED
-metroid-zero: OK
+metroid-zero: DOWNLOADED
 ```
 
 ## 4) Install 3DS client
 
 Use artifact:
 
-- `dist/3ds/savesync-3ds-v0.1.0/gbasync.3dsx`
+- `dist/3ds/savesync-3ds-v0.1.1/gbasync.3dsx`
 
 On SD card:
 
@@ -135,10 +139,35 @@ url=http://YOUR_SERVER_IP:8080
 api_key=change-me
 
 [sync]
+mode=normal
 save_dir=sdmc:/saves
+vc_save_dir=sdmc:/3ds/Checkpoint/saves
+
+[rom]
+rom_dir=sdmc:/roms/gba
+rom_extension=.gba
 ```
 
 Launch from Homebrew Launcher and press `START` to exit.
+
+3DS mode options:
+
+- `mode=normal`: sync plain `.sav` files in `save_dir`
+- `mode=vc`: sync saves from `vc_save_dir` (intended for VC export/import workflows)
+
+### 3DS VC inject workflow
+
+For VC inject titles, SaveSync does not write directly into Nintendo save archives.
+Use this cycle:
+
+1. Export VC save with your save manager (for example, Checkpoint).
+2. Ensure exported `.sav` lands under `vc_save_dir`.
+3. Run SaveSync 3DS client with `mode=vc`.
+4. Sync other device(s).
+5. Export/pull latest save back into `vc_save_dir`.
+6. Import save back into VC title via save manager.
+
+See `VC_WORKFLOW.md` for a full step-by-step guide.
 
 Expected in-app output example:
 
@@ -152,8 +181,8 @@ pokemon-emerald: DOWNLOADED
 ## 5) Validate cross-device sync
 
 1. Run one client (Delta/Switch/3DS) and make save progress.
-2. Sync that client.
-3. Run another client and sync.
+2. On the source console, press upload-only (`X`) to push saves to server.
+3. On the destination console, press download-only (`Y`) to pull saves from server.
 4. Confirm same progress appears on second client.
 5. Verify metadata via:
 
@@ -161,21 +190,40 @@ pokemon-emerald: DOWNLOADED
 curl -H "X-API-Key: change-me" http://YOUR_SERVER_IP:8080/saves
 ```
 
+Quick local smoke test (server + bridge only):
+
+```bash
+./scripts/smoke-sync.sh
+```
+
 ## 6) Common issues
 
 - **401 unauthorized**: API key mismatch.
 - **No saves found**: wrong `save_dir`, missing `.sav` files.
 - **Cannot connect**: wrong server IP/port or firewall block.
-- **No cross-device update**: sync one side, then sync the other side.
+- **No cross-device update**: use `X` on source device, then `Y` on destination device.
 - **Conflicts**: check `GET /conflicts`, resolve via `POST /resolve/{game_id}`.
 
-## 7) Current MVP limits
+## 7) Game ID normalization
+
+Bridge game ID resolution order:
+
+1. ROM header (`title + game code`) when a matching ROM is found
+2. Fallback to normalized save filename stem
+
+To improve cross-device matching accuracy, set in bridge config:
+
+- `rom_dirs`: list of directories containing `.gba` ROMs
+- `rom_map_path`: optional JSON map `{ "Save File Stem": "/full/path/to/ROM.gba" }`
+- `rom_extensions`: ROM extensions for auto-matching (default `[".gba"]`)
+
+## 8) Current MVP limits
 
 - Switch/3DS clients currently use HTTP.
-- Game ID is filename-derived in this version.
+- Switch/3DS clients still derive `game_id` from filename (bridge is now ROM-header-aware).
 - Console sync is manual (app-triggered), not background.
 
-## 8) Dist artifact reference
+## 9) Dist artifact reference
 
 ### `dist/server`
 

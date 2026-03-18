@@ -8,6 +8,7 @@ VERSION="${1:-dev}"
 IMAGE_TAG="savesync-server:${VERSION}"
 
 mkdir -p "$DIST_DIR"
+rm -f "$DIST_DIR/.env"
 
 echo "Building Docker image: $IMAGE_TAG"
 docker build -t "$IMAGE_TAG" "$SERVER_DIR"
