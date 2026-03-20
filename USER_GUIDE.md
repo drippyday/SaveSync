@@ -89,7 +89,7 @@ Expected watch-mode output example:
 
 Use artifact:
 
-- `dist/switch/savesync-switch-v0.1.1/gbasync.nro`
+- `dist/switch/savesync-switch-v0.1.2/gbasync.nro`
 
 On SD card:
 
@@ -132,7 +132,7 @@ metroid-zero: DOWNLOADED
 
 Use artifact:
 
-- `dist/3ds/savesync-3ds-v0.1.1/gbasync.3dsx`
+- `dist/3ds/savesync-3ds-v0.1.2/gbasync.3dsx`
 
 On SD card:
 

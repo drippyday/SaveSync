@@ -66,10 +66,10 @@ python bridge.py --config config.json --once
 Generate release artifacts:
 
 ```bash
-./scripts/release-server.sh v0.1.1
-./scripts/release-bridge.sh v0.1.1
-./scripts/release-switch.sh v0.1.1
-./scripts/release-3ds.sh v0.1.1
+./scripts/release-server.sh v0.1.2
+./scripts/release-bridge.sh v0.1.2
+./scripts/release-switch.sh v0.1.2
+./scripts/release-3ds.sh v0.1.2
 ```
 
 Then use:

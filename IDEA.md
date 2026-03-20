@@ -64,10 +64,10 @@ Use `dist/README.md` for artifact-by-artifact install guidance.
 Quick commands:
 
 ```bash
-./scripts/release-server.sh v0.1.1
-./scripts/release-bridge.sh v0.1.1
-./scripts/release-switch.sh v0.1.1
-./scripts/release-3ds.sh v0.1.1
+./scripts/release-server.sh v0.1.2
+./scripts/release-bridge.sh v0.1.2
+./scripts/release-switch.sh v0.1.2
+./scripts/release-3ds.sh v0.1.2
 ```
 
 ## Shared concepts

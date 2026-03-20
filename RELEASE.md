@@ -15,12 +15,12 @@ Produces:
 Command:
 
 ```bash
-./scripts/release-server.sh v0.1.1
+./scripts/release-server.sh v0.1.2
 ```
 
 Artifacts:
 
-- `dist/server/savesync-server-v0.1.1.tar`
+- `dist/server/savesync-server-v0.1.2.tar`
 - `dist/server/.env.example`
 - `dist/server/docker-compose.yml`
 
@@ -33,12 +33,12 @@ Produces:
 Command:
 
 ```bash
-./scripts/release-bridge.sh v0.1.1
+./scripts/release-bridge.sh v0.1.2
 ```
 
 Artifact:
 
-- `dist/bridge/savesync-bridge-v0.1.1.zip`
+- `dist/bridge/savesync-bridge-v0.1.2.zip`
 
 ## 3) Switch release
 
@@ -50,12 +50,12 @@ Prerequisites:
 Command:
 
 ```bash
-./scripts/release-switch.sh v0.1.1
+./scripts/release-switch.sh v0.1.2
 ```
 
 Artifacts directory:
 
-- `dist/switch/savesync-switch-v0.1.1/`
+- `dist/switch/savesync-switch-v0.1.2/`
 
 Expected files (depending on build):
 
@@ -73,12 +73,12 @@ Prerequisites:
 Command:
 
 ```bash
-./scripts/release-3ds.sh v0.1.1
+./scripts/release-3ds.sh v0.1.2
 ```
 
 Artifacts directory:
 
-- `dist/3ds/savesync-3ds-v0.1.1/`
+- `dist/3ds/savesync-3ds-v0.1.2/`
 
 Expected files (depending on build):
 
