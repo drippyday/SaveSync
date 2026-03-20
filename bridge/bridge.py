@@ -23,6 +23,14 @@ def utc_iso_from_mtime(mtime: float) -> str:
     return datetime.fromtimestamp(mtime, timezone.utc).replace(microsecond=0).isoformat()
 
 
+def utc_iso_for_local_sav(path: Path) -> str:
+    """Match console clients: st_mtime == 0 means unset on some FAT stacks — use wall clock."""
+    m = path.stat().st_mtime
+    if m == 0:
+        return utc_iso_from_mtime(time.time())
+    return utc_iso_from_mtime(m)
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -54,10 +62,9 @@ class Config:
 
 
 class SyncBridge:
-    def __init__(self, config: Config, dry_run: bool = False, verbose: bool = False):
+    def __init__(self, config: Config, dry_run: bool = False):
         self.cfg = config
         self.dry_run = dry_run
-        self.verbose = verbose
         self._session = requests.Session()
         self._session.headers.update({"X-API-Key": self.cfg.api_key})
         self._lock = threading.Lock()
@@ -69,10 +76,6 @@ class SyncBridge:
 
     def log(self, msg: str) -> None:
         print(msg, flush=True)
-
-    def debug(self, msg: str) -> None:
-        if self.verbose:
-            self.log(f"[debug] {msg}")
 
     def _list_remote(self) -> dict[str, dict[str, Any]]:
         resp = self._session.get(f"{self.cfg.server_url}/saves", timeout=20)
@@ -92,8 +95,7 @@ class SyncBridge:
             return
         data = path.read_bytes()
         game_id = self._game_id_resolver.resolve(path)
-        mtime = path.stat().st_mtime
-        last_modified_utc = utc_iso_from_mtime(mtime)
+        last_modified_utc = utc_iso_for_local_sav(path)
         digest = sha256_bytes(data)
         params = {
             "last_modified_utc": last_modified_utc,
@@ -108,6 +110,9 @@ class SyncBridge:
         resp = self._session.put(f"{self.cfg.server_url}/save/{game_id}", params=params, data=data, timeout=30)
         resp.raise_for_status()
         info = resp.json()
+        if not info.get("applied", True):
+            self.log(f"[rejected] server kept existing copy for {path.name} (no-op upload)")
+            return
         if info.get("conflict"):
             self.log(f"[conflict] server marked conflict for {path.name}")
         else:
@@ -133,9 +138,9 @@ class SyncBridge:
             local_files = sorted(self.cfg.delta_save_dir.glob("*.sav"))
             local_by_id = {self._game_id_resolver.resolve(p): p for p in local_files}
 
-            # upload local-newer or local-only
+            # upload local-newer or local-only (same time ordering as console Auto)
             for game_id, path in local_by_id.items():
-                local_mtime_iso = utc_iso_from_mtime(path.stat().st_mtime)
+                local_mtime_iso = utc_iso_for_local_sav(path)
                 local_sha = sha256_bytes(path.read_bytes())
                 remote_meta = remote.get(game_id)
                 if remote_meta is None:
@@ -144,11 +149,7 @@ class SyncBridge:
                 remote_sha = str(remote_meta.get("sha256", "") or "")
                 if remote_sha and local_sha == remote_sha:
                     continue
-                if remote_sha:
-                    self._upload_file(path)
-                    continue
-                # Fallback path for old metadata records without sha256.
-                remote_ts = str(remote_meta.get("last_modified_utc", "") or self._remote_cmp_ts(remote_meta))
+                remote_ts = self._remote_cmp_ts(remote_meta)
                 if local_mtime_iso > remote_ts:
                     self._upload_file(path)
 
@@ -159,7 +160,7 @@ class SyncBridge:
                 if local is None:
                     self._download_to_path(game_id, meta.get("filename_hint"))
                     continue
-                local_mtime_iso = utc_iso_from_mtime(local.stat().st_mtime)
+                local_mtime_iso = utc_iso_for_local_sav(local)
                 remote_ts = self._remote_cmp_ts(meta)
                 if remote_ts > local_mtime_iso:
                     self._download_to_path(game_id, meta.get("filename_hint"))
@@ -189,7 +190,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--watch", action="store_true", help="Run continuous sync loop")
     parser.add_argument("--once", action="store_true", help="Run one sync pass then exit")
     parser.add_argument("--dry-run", action="store_true", help="Show actions only")
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logs")
     return parser.parse_args()
 
 
@@ -218,7 +218,7 @@ def main() -> None:
     if not args.watch and not args.once:
         raise SystemExit("Choose --once or --watch")
     cfg = Config.load(Path(args.config))
-    bridge = SyncBridge(cfg, dry_run=args.dry_run, verbose=args.verbose)
+    bridge = SyncBridge(cfg, dry_run=args.dry_run)
     if args.once:
         bridge.sync_once()
         return

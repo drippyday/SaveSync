@@ -97,12 +97,14 @@ Expected files (depending on build):
 4. Build 3DS client
 5. Generate all `dist/` artifacts
 6. Publish release notes with:
-   - API changes
+   - API changes (e.g. new **`DELETE /save/{game_id}`**)
+   - console UX (baseline Auto, conflict UI, confirm + post-sync screens)
    - known limitations
    - upgrade steps
 
 ## Current limitations to mention in releases
 
-- 3DS client MVP is HTTP-only (no TLS in this build path).
-- Game ID currently defaults to filename-derived normalization.
+- Console clients are **HTTP-only** (no TLS in this build path).
+- **`game_id`:** ROM header when ROM paths are configured; else filename stem normalization.
 - No background execution on Switch/3DS; sync is app-triggered.
+- Server listing is **`index.json`**-backed; admins may need **`DELETE /save/{game_id}`** after test uploads.

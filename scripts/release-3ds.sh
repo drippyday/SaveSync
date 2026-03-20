@@ -67,9 +67,9 @@ rom_extension=.gba
 Run:
 1) Launch Homebrew Launcher
 2) Start gbasync
-3) A = full sync (upload-all then download-all)
-4) X = upload-only (force overwrite to server)
-5) Y = download-only (overwrite local from server)
+3) A = full sync (per-game newer local mtime vs server; may upload some, download others)
+4) X = upload-only: confirm, pick saves; START or R or X to run, B = cancel
+5) Y = download-only: pick saves; START or R or Y to run, B = cancel
 6) Press START to exit
 
 Expected status example:

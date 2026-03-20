@@ -30,6 +30,7 @@ python bridge.py --config config.json --once
 
 ## Notes
 
+- Stale **`game_id`** rows on the server (e.g. after experiments) are removed with **`DELETE /save/{game_id}`** — see root **`server/README.md`** / **`USER_GUIDE.md`** (`index.json` is authoritative for **`GET /saves`**).
 - Game ID resolution order:
   1. If matching ROM is found, derive from GBA ROM header (`title + game code`)
   2. Fallback to normalized `.sav` filename stem

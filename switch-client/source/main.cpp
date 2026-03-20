@@ -4,16 +4,21 @@
 #include <arpa/inet.h>
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <strings.h>
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <set>
 #include <netdb.h>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -42,12 +47,24 @@ struct LocalSave {
   std::string last_modified_utc;
   std::string sha256;
   size_t size_bytes = 0;
+  bool mtime_trusted = false;
+  std::int64_t st_mtime_unix = -1;
+};
+
+struct BaselineRow {
+  std::string game_id;
+  std::string sha256;
 };
 
 enum class SyncAction {
   Auto,
   UploadOnly,
   DownloadOnly,
+};
+
+struct SyncManualFilter {
+  bool all = true;
+  std::set<std::string> ids;
 };
 
 static std::string trim(const std::string& input) {
@@ -286,13 +303,138 @@ static std::string url_encode_simple(const std::string& input) {
   return out.str();
 }
 
+static bool headersHaveChunked(std::string_view hdr) {
+  size_t pos = 0;
+  while (pos < hdr.size()) {
+    const size_t eol = hdr.find("\r\n", pos);
+    if (eol == std::string::npos) return false;
+    const size_t lineLen = eol - pos;
+    if (lineLen >= 18 && strncasecmp(hdr.data() + pos, "transfer-encoding:", 18) == 0) {
+      size_t q = pos + 18;
+      while (q < eol && (hdr[q] == ' ' || hdr[q] == '\t')) q++;
+      for (; q + 7 <= eol; q++) {
+        if (strncasecmp(hdr.data() + q, "chunked", 7) == 0) return true;
+      }
+    }
+    pos = eol + 2;
+  }
+  return false;
+}
+
+static long contentLengthFromHeaders(std::string_view hdr) {
+  size_t pos = 0;
+  while (pos < hdr.size()) {
+    const size_t eol = hdr.find("\r\n", pos);
+    if (eol == std::string::npos) return -1;
+    const size_t lineLen = eol - pos;
+    if (lineLen >= 15 && strncasecmp(hdr.data() + pos, "content-length:", 15) == 0) {
+      size_t v0 = pos + 15;
+      while (v0 < eol && (hdr[v0] == ' ' || hdr[v0] == '\t')) v0++;
+      return std::strtol(std::string(hdr.substr(v0, eol - v0)).c_str(), nullptr, 10);
+    }
+    pos = eol + 2;
+  }
+  return -1;
+}
+
+static bool decodeChunked(const std::vector<unsigned char>& in, std::vector<unsigned char>& out) {
+  out.clear();
+  size_t pos = 0;
+  while (pos < in.size()) {
+    const size_t line0 = pos;
+    while (pos + 1 < in.size() && !(in[pos] == '\r' && in[pos + 1] == '\n')) pos++;
+    if (pos + 1 >= in.size()) return false;
+    std::string line(reinterpret_cast<const char*>(in.data() + line0), pos - line0);
+    char* endhex = nullptr;
+    unsigned long csz = std::strtoul(line.c_str(), &endhex, 16);
+    if (endhex == line.c_str()) return false;
+    pos += 2;
+    if (csz == 0) break;
+    if (csz > 100000000UL || pos + csz > in.size()) return false;
+    out.insert(out.end(), in.begin() + static_cast<std::ptrdiff_t>(pos),
+               in.begin() + static_cast<std::ptrdiff_t>(pos + csz));
+    pos += csz;
+    if (pos + 1 >= in.size() || in[pos] != '\r' || in[pos + 1] != '\n') return false;
+    pos += 2;
+  }
+  return true;
+}
+
+static bool jsonWs(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static bool jsonBoolAfterColon(std::string_view body, size_t& j, std::string_view word) {
+  while (j < body.size() && jsonWs(static_cast<unsigned char>(body[j]))) j++;
+  if (j + word.size() > body.size() || body.substr(j, word.size()) != word) return false;
+  j += word.size();
+  if (j < body.size()) {
+    const unsigned char t = static_cast<unsigned char>(body[j]);
+    if (!jsonWs(t) && t != ',' && t != '}' && t != ']') return false;
+  }
+  return true;
+}
+
+static bool jsonBodyHasAppliedMember(std::string_view body) {
+  static constexpr std::string_view kApplied = "\"applied\"";
+  for (size_t i = 0; i + kApplied.size() <= body.size(); i++) {
+    if (body.substr(i, kApplied.size()) != kApplied) continue;
+    const size_t after = i + kApplied.size();
+    if (after < body.size()) {
+      const unsigned char c = static_cast<unsigned char>(body[after]);
+      if (std::isalnum(c) != 0 || c == '_') continue;
+    }
+    size_t j = after;
+    while (j < body.size() && jsonWs(static_cast<unsigned char>(body[j]))) j++;
+    if (j < body.size() && body[j] == ':') return true;
+  }
+  return false;
+}
+
+static bool jsonBodyAppliedIsTrue(std::string_view body) {
+  static constexpr std::string_view kApplied = "\"applied\"";
+  for (size_t i = 0; i + kApplied.size() <= body.size(); i++) {
+    if (body.substr(i, kApplied.size()) != kApplied) continue;
+    const size_t after = i + kApplied.size();
+    if (after < body.size()) {
+      const unsigned char c = static_cast<unsigned char>(body[after]);
+      if (std::isalnum(c) != 0 || c == '_') continue;
+    }
+    size_t j = after;
+    while (j < body.size() && jsonWs(static_cast<unsigned char>(body[j]))) j++;
+    if (j >= body.size() || body[j] != ':') continue;
+    j++;
+    if (jsonBoolAfterColon(body, j, "true")) return true;
+  }
+  return false;
+}
+
+static bool jsonBodyAppliedIsFalse(std::string_view body) {
+  static constexpr std::string_view kApplied = "\"applied\"";
+  for (size_t i = 0; i + kApplied.size() <= body.size(); i++) {
+    if (body.substr(i, kApplied.size()) != kApplied) continue;
+    const size_t after = i + kApplied.size();
+    if (after < body.size()) {
+      const unsigned char c = static_cast<unsigned char>(body[after]);
+      if (std::isalnum(c) != 0 || c == '_') continue;
+    }
+    size_t j = after;
+    while (j < body.size() && jsonWs(static_cast<unsigned char>(body[j]))) j++;
+    if (j >= body.size() || body[j] != ':') continue;
+    j++;
+    if (jsonBoolAfterColon(body, j, "false")) return true;
+  }
+  return false;
+}
+
 static bool http_request(
     const Config& cfg,
     const std::string& method,
     const std::string& target_path,
     const std::vector<unsigned char>& body,
     int& out_status,
-    std::vector<unsigned char>& out_body) {
+    std::vector<unsigned char>& out_body,
+    const char* content_type = nullptr) {
   ParsedUrl parsed;
   if (!parse_server_url(cfg.server_url, parsed)) return false;
 
@@ -315,11 +457,13 @@ static bool http_request(
   }
   freeaddrinfo(res);
 
+  const char* ct = content_type ? content_type : "application/octet-stream";
   std::ostringstream request;
   request << method << " " << target_path << " HTTP/1.1\r\n";
   request << "Host: " << parsed.host << "\r\n";
+  request << "Accept-Encoding: identity\r\n";
   request << "X-API-Key: " << cfg.api_key << "\r\n";
-  request << "Content-Type: application/octet-stream\r\n";
+  request << "Content-Type: " << ct << "\r\n";
   request << "Content-Length: " << body.size() << "\r\n";
   request << "Connection: close\r\n\r\n";
   const std::string header = request.str();
@@ -352,7 +496,21 @@ static bool http_request(
 
   const auto body_pos = response_str.find("\r\n\r\n");
   if (body_pos == std::string::npos) return false;
-  out_body.assign(response.begin() + static_cast<long>(body_pos + 4), response.end());
+  const std::string_view header_view(response_str.data(), body_pos);
+  const size_t raw_begin = body_pos + 4;
+  std::vector<unsigned char> raw_body(response.begin() + static_cast<std::ptrdiff_t>(raw_begin),
+                                         response.end());
+  if (headersHaveChunked(header_view)) {
+    if (!decodeChunked(raw_body, out_body)) return false;
+  } else {
+    long cl = contentLengthFromHeaders(header_view);
+    size_t use = raw_body.size();
+    if (cl >= 0) {
+      const auto cl_u = static_cast<size_t>(cl);
+      if (cl_u < use) use = cl_u;
+    }
+    out_body.assign(raw_body.begin(), raw_body.begin() + static_cast<std::ptrdiff_t>(use));
+  }
   return true;
 }
 
@@ -435,7 +593,15 @@ static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::str
     s.game_id = chosen_id;
     struct stat st{};
     if (stat(s.path.c_str(), &st) != 0) continue;
-    s.last_modified_utc = mtime_to_utc_iso(st.st_mtime);
+    s.st_mtime_unix = static_cast<std::int64_t>(st.st_mtime);
+    if (st.st_mtime == 0) {
+      // Some SD/FAT stacks leave mtime at epoch = "unset"; file can still be new.
+      s.last_modified_utc = mtime_to_utc_iso(std::time(nullptr));
+      s.mtime_trusted = true;
+    } else {
+      s.last_modified_utc = mtime_to_utc_iso(st.st_mtime);
+      s.mtime_trusted = (st.st_mtime >= 946684800L);  // ignore pre-2000 mtimes (common bogus FAT values)
+    }
     std::vector<unsigned char> bytes = read_file(s.path);
     s.size_bytes = bytes.size();
     s.sha256 = sha256_impl::hash(bytes);
@@ -445,12 +611,398 @@ static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::str
   return out;
 }
 
-static std::vector<std::string> run_sync(const Config& cfg, SyncAction action) {
+static std::string baseline_file_path(const Config& cfg) {
+  std::string d = cfg.save_dir;
+  while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+  return d + "/.savesync-baseline";
+}
+
+static std::vector<BaselineRow> baseline_load(const Config& cfg) {
+  std::vector<BaselineRow> rows;
+  std::ifstream in(baseline_file_path(cfg));
+  std::string line;
+  while (rows.size() < 256 && std::getline(in, line)) {
+    const auto tab = line.find('\t');
+    if (tab == std::string::npos) continue;
+    std::string gid = line.substr(0, tab);
+    std::string sha = line.substr(tab + 1);
+    while (!sha.empty() && (sha.back() == '\r' || sha.back() == '\n')) sha.pop_back();
+    if (gid.empty() || sha.size() != 64) continue;
+    rows.push_back({std::move(gid), std::move(sha)});
+  }
+  return rows;
+}
+
+static bool baseline_save(const Config& cfg, const std::vector<BaselineRow>& rows) {
+  const std::string path = baseline_file_path(cfg);
+  const std::string tmp = path + ".tmp";
+  std::ofstream out(tmp);
+  if (!out) return false;
+  for (const auto& r : rows) out << r.game_id << '\t' << r.sha256 << '\n';
+  out.close();
+  std::remove(path.c_str());
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    std::remove(tmp.c_str());
+    return false;
+  }
+  return true;
+}
+
+static bool baseline_get_sha(const std::vector<BaselineRow>& rows, const std::string& id, std::string* out_sha) {
+  for (const auto& r : rows) {
+    if (r.game_id == id && r.sha256.size() == 64) {
+      *out_sha = r.sha256;
+      return true;
+    }
+  }
+  return false;
+}
+
+static void baseline_upsert(std::vector<BaselineRow>& rows, const std::string& id, const std::string& sha) {
+  for (auto& r : rows) {
+    if (r.game_id == id) {
+      r.sha256 = sha;
+      return;
+    }
+  }
+  rows.push_back({id, sha});
+}
+
+static void debug_report_sync_start_switch(const Config& cfg, const std::vector<LocalSave>& local) {
+  int untrusted = 0;
+  for (const auto& s : local) {
+    if (!s.mtime_trusted) untrusted++;
+  }
+  std::ostringstream json;
+  json << "{\"utc_iso\":\"" << mtime_to_utc_iso(std::time(nullptr))
+       << "\",\"platform\":\"switch-homebrew\",\"phase\":\"sync_auto_start\",\"untrusted_local_saves\":"
+       << untrusted << "}";
+  const std::string jstr = json.str();
+  std::vector<unsigned char> post_body(jstr.begin(), jstr.end());
+  int st = 0;
+  std::vector<unsigned char> resp;
+  (void)http_request(cfg, "POST", "/debug/client-clock", post_body, st, resp, "application/json");
+}
+
+static bool bodyContainsSha256Value(const std::string& body, const std::string& expect) {
+  if (expect.size() != 64) return false;
+  const std::string key = "\"sha256\"";
+  size_t pos = 0;
+  while ((pos = body.find(key, pos)) != std::string::npos) {
+    size_t j = pos + key.size();
+    while (j < body.size() && std::isspace(static_cast<unsigned char>(body[j]))) j++;
+    if (j >= body.size() || body[j] != ':') {
+      pos++;
+      continue;
+    }
+    j++;
+    while (j < body.size() && (body[j] == ' ' || body[j] == '\t')) j++;
+    if (j >= body.size() || body[j] != '"') {
+      pos++;
+      continue;
+    }
+    j++;
+    if (j + 64 > body.size()) {
+      pos++;
+      continue;
+    }
+    std::string candidate = body.substr(j, 64);
+    bool hex = true;
+    for (char c : candidate) {
+      if (!std::isxdigit(static_cast<unsigned char>(c))) {
+        hex = false;
+        break;
+      }
+    }
+    if (hex && strcasecmp(candidate.c_str(), expect.c_str()) == 0) return true;
+    pos = j;
+  }
+  return false;
+}
+
+static bool put_save_log(const Config& cfg,
+                         const LocalSave& l,
+                         bool force,
+                         const std::string& platform,
+                         std::vector<std::string>& logs) {
+  const std::vector<unsigned char> bytes = read_file(l.path);
+  std::ostringstream path;
+  path << "/save/" << l.game_id << "?last_modified_utc=" << url_encode_simple(l.last_modified_utc)
+       << "&sha256=" << url_encode_simple(l.sha256) << "&size_bytes=" << l.size_bytes
+       << "&filename_hint=" << url_encode_simple(l.name) << "&platform_source=" << platform
+       << "&client_clock_utc=" << url_encode_simple(mtime_to_utc_iso(std::time(nullptr)));
+  if (force) path << "&force=1";
+  std::vector<unsigned char> put_resp;
+  int put_status = 0;
+  if (!http_request(cfg, "PUT", path.str(), bytes, put_status, put_resp) || put_status != 200) {
+    logs.push_back(l.game_id + ": ERROR(upload)");
+    return false;
+  }
+  const std::string body(put_resp.begin(), put_resp.end());
+  const std::string_view bv(body);
+  if (jsonBodyAppliedIsFalse(bv)) {
+    logs.push_back(l.game_id + ": REJECTED (server kept existing copy)");
+    return false;
+  }
+  if (jsonBodyAppliedIsTrue(bv) || !jsonBodyHasAppliedMember(bv)) {
+    logs.push_back(l.game_id + ": UPLOADED");
+    return true;
+  }
+  bool ok = bodyContainsSha256Value(body, l.sha256);
+  if (!ok) {
+    std::vector<unsigned char> meta_body;
+    int mst = 0;
+    if (http_request(cfg, "GET", "/save/" + l.game_id + "/meta", {}, mst, meta_body) && mst == 200) {
+      const std::string mb(meta_body.begin(), meta_body.end());
+      ok = bodyContainsSha256Value(mb, l.sha256);
+    }
+  }
+  if (!ok) {
+    logs.push_back(l.game_id + ": REJECTED (could not confirm save on server)");
+    return false;
+  }
+  logs.push_back(l.game_id + ": UPLOADED");
+  return true;
+}
+
+static bool get_save_log(const Config& cfg, const std::string& id, const SaveMeta& r, std::vector<std::string>& logs) {
+  std::string fallback_name = id + ".sav";
+  std::string target_name = r.filename_hint.empty() ? fallback_name : sanitize_filename(r.filename_hint, fallback_name);
+  if (!has_sav_extension(target_name)) target_name += ".sav";
+  const std::string target_path = cfg.save_dir + "/" + target_name;
+  std::vector<unsigned char> save_data;
+  int get_status = 0;
+  if (!http_request(cfg, "GET", "/save/" + id, {}, get_status, save_data) || get_status != 200) {
+    logs.push_back(id + ": ERROR(download)");
+    return false;
+  }
+  if (write_atomic(target_path, save_data)) {
+    logs.push_back(id + ": DOWNLOADED");
+    return true;
+  }
+  logs.push_back(id + ": ERROR(write)");
+  return false;
+}
+
+static void resolve_both_changed_conflict_switch(PadState* pad,
+                                                 const Config& cfg,
+                                                 const std::string& id,
+                                                 const LocalSave& l,
+                                                 const SaveMeta& r,
+                                                 const std::string& plat,
+                                                 std::vector<std::string>& logs,
+                                                 std::vector<BaselineRow>& baseline) {
+  consoleClear();
+  printf("\n  -------- Conflict --------\n\n  %s\n\n", id.c_str());
+  printf("  Local and server both changed since\n");
+  printf("  the last successful sync.\n\n");
+  printf("  X   Upload local (overwrite server)\n");
+  printf("  Y   Download server (overwrite local)\n");
+  printf("  B   Skip for now\n\n");
+  consoleUpdate(NULL);
+  while (appletMainLoop()) {
+    padUpdate(pad);
+    const u64 down = padGetButtonsDown(pad);
+    if (down & HidNpadButton_X) {
+      if (put_save_log(cfg, l, true, plat, logs)) baseline_upsert(baseline, id, l.sha256);
+      break;
+    }
+    if (down & HidNpadButton_Y) {
+      if (get_save_log(cfg, id, r, logs)) baseline_upsert(baseline, id, r.sha256);
+      break;
+    }
+    if (down & HidNpadButton_B) break;
+    consoleUpdate(NULL);
+  }
+}
+
+static bool pick_upload_selection(PadState* pad, const Config& cfg, SyncManualFilter* out) {
+  auto locals = scan_local_saves(cfg, cfg.save_dir);
+  if (locals.empty()) {
+    printf("No local .sav files to upload.\n");
+    return false;
+  }
+  const int n = static_cast<int>(locals.size());
+  std::vector<bool> picked(static_cast<size_t>(n), true);
+  bool master_all = true;
+  int cursor = 0;
+  int scroll = 0;
+  constexpr int kVisible = 16;
+
+  while (appletMainLoop()) {
+    padUpdate(pad);
+    const u64 down = padGetButtonsDown(pad);
+    if (down & HidNpadButton_Plus) {
+      if (master_all) {
+        out->all = true;
+        out->ids.clear();
+        return true;
+      }
+      out->all = false;
+      out->ids.clear();
+      for (int i = 0; i < n; i++) {
+        if (picked[static_cast<size_t>(i)]) out->ids.insert(locals[static_cast<size_t>(i)].game_id);
+      }
+      if (out->ids.empty()) continue;
+      return true;
+    }
+    if (down & HidNpadButton_B) return false;
+
+    const int total_rows = n + 1;
+    if (down & HidNpadButton_Up) {
+      cursor = (cursor + total_rows - 1) % total_rows;
+    }
+    if (down & HidNpadButton_Down) {
+      cursor = (cursor + 1) % total_rows;
+    }
+    if (down & HidNpadButton_A) {
+      if (cursor == 0) {
+        master_all = !master_all;
+        const bool v = master_all;
+        for (int i = 0; i < n; i++) picked[static_cast<size_t>(i)] = v;
+      } else {
+        picked[static_cast<size_t>(cursor - 1)] = !picked[static_cast<size_t>(cursor - 1)];
+        master_all = true;
+        for (int i = 0; i < n; i++) {
+          if (!picked[static_cast<size_t>(i)]) master_all = false;
+        }
+      }
+    }
+
+    if (cursor < scroll) scroll = cursor;
+    if (cursor >= scroll + kVisible) scroll = cursor - kVisible + 1;
+    if (scroll < 0) scroll = 0;
+    const int max_scroll = std::max(0, total_rows - kVisible);
+    if (scroll > max_scroll) scroll = max_scroll;
+
+    consoleClear();
+    printf("Upload: choose saves\n");
+    printf("D-pad: move   A: toggle   +: run upload   B: back to menu\n\n");
+    for (int row = scroll; row < std::min(scroll + kVisible, total_rows); row++) {
+      const char mark = (row == cursor) ? '>' : ' ';
+      if (row == 0) {
+        printf("%c [%c] ALL SAVES\n", mark, master_all ? 'x' : ' ');
+      } else {
+        const LocalSave& L = locals[static_cast<size_t>(row - 1)];
+        printf(
+            "%c [%c] %.28s (%.36s)\n",
+            mark,
+            picked[static_cast<size_t>(row - 1)] ? 'x' : ' ',
+            L.game_id.c_str(),
+            L.name.c_str());
+      }
+    }
+    consoleUpdate(NULL);
+  }
+  return false;
+}
+
+static bool pick_download_selection(PadState* pad, const Config& cfg, SyncManualFilter* out) {
+  int status = 0;
+  std::vector<unsigned char> body;
+  if (!http_request(cfg, "GET", "/saves", {}, status, body) || status != 200) {
+    printf("ERROR: GET /saves failed (cannot list downloads)\n");
+    return false;
+  }
+  std::string json(body.begin(), body.end());
+  auto remote = parse_saves_json(json);
+  if (remote.empty()) {
+    printf("No remote saves to download.\n");
+    return false;
+  }
+  std::vector<std::pair<std::string, SaveMeta>> rows;
+  rows.reserve(remote.size());
+  for (const auto& kv : remote) rows.push_back(kv);
+  std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  const int n = static_cast<int>(rows.size());
+  std::vector<bool> picked(static_cast<size_t>(n), true);
+  bool master_all = true;
+  int cursor = 0;
+  int scroll = 0;
+  constexpr int kVisible = 16;
+
+  while (appletMainLoop()) {
+    padUpdate(pad);
+    const u64 down = padGetButtonsDown(pad);
+    if (down & HidNpadButton_Plus) {
+      if (master_all) {
+        out->all = true;
+        out->ids.clear();
+        return true;
+      }
+      out->all = false;
+      out->ids.clear();
+      for (int i = 0; i < n; i++) {
+        if (picked[static_cast<size_t>(i)]) out->ids.insert(rows[static_cast<size_t>(i)].first);
+      }
+      if (out->ids.empty()) continue;
+      return true;
+    }
+    if (down & HidNpadButton_B) return false;
+
+    const int total_rows = n + 1;
+    if (down & HidNpadButton_Up) {
+      cursor = (cursor + total_rows - 1) % total_rows;
+    }
+    if (down & HidNpadButton_Down) {
+      cursor = (cursor + 1) % total_rows;
+    }
+    if (down & HidNpadButton_A) {
+      if (cursor == 0) {
+        master_all = !master_all;
+        const bool v = master_all;
+        for (int i = 0; i < n; i++) picked[static_cast<size_t>(i)] = v;
+      } else {
+        picked[static_cast<size_t>(cursor - 1)] = !picked[static_cast<size_t>(cursor - 1)];
+        master_all = true;
+        for (int i = 0; i < n; i++) {
+          if (!picked[static_cast<size_t>(i)]) master_all = false;
+        }
+      }
+    }
+
+    if (cursor < scroll) scroll = cursor;
+    if (cursor >= scroll + kVisible) scroll = cursor - kVisible + 1;
+    if (scroll < 0) scroll = 0;
+    const int max_scroll = std::max(0, total_rows - kVisible);
+    if (scroll > max_scroll) scroll = max_scroll;
+
+    consoleClear();
+    printf("Download: choose saves\n");
+    printf("D-pad: move   A: toggle   +: run download   B: back to menu\n\n");
+    for (int row = scroll; row < std::min(scroll + kVisible, total_rows); row++) {
+      const char mark = (row == cursor) ? '>' : ' ';
+      if (row == 0) {
+        printf("%c [%c] ALL SAVES\n", mark, master_all ? 'x' : ' ');
+      } else {
+        const SaveMeta& R = rows[static_cast<size_t>(row - 1)].second;
+        const char* hint = R.filename_hint.empty() ? "-" : R.filename_hint.c_str();
+        printf(
+            "%c [%c] %.28s (%.36s)\n",
+            mark,
+            picked[static_cast<size_t>(row - 1)] ? 'x' : ' ',
+            R.game_id.c_str(),
+            hint);
+      }
+    }
+    consoleUpdate(NULL);
+  }
+  return false;
+}
+
+static std::vector<std::string> run_sync(
+    const Config& cfg,
+    SyncAction action,
+    const SyncManualFilter* xy_filter,
+    PadState* pad) {
   std::vector<std::string> logs;
   auto local = scan_local_saves(cfg, cfg.save_dir);
   std::map<std::string, LocalSave> local_by_id;
   for (const auto& s : local) local_by_id[s.game_id] = s;
   logs.push_back("Local saves: " + std::to_string(local.size()));
+
+  std::vector<BaselineRow> baseline = baseline_load(cfg);
 
   int status = 0;
   std::vector<unsigned char> body;
@@ -468,63 +1020,79 @@ static std::vector<std::string> run_sync(const Config& cfg, SyncAction action) {
   auto remote = parse_saves_json(json);
   logs.push_back("Remote saves: " + std::to_string(remote.size()));
 
-  if (action != SyncAction::DownloadOnly) {
-    for (const auto& [id, l] : local_by_id) {
-      const std::vector<unsigned char> bytes = read_file(l.path);
-      std::ostringstream path;
-      path << "/save/" << id
-           << "?last_modified_utc=" << url_encode_simple(l.last_modified_utc)
-           << "&sha256=" << url_encode_simple(l.sha256)
-           << "&size_bytes=" << l.size_bytes
-           << "&filename_hint=" << url_encode_simple(l.name)
-           << "&platform_source=switch-homebrew"
-           << "&force=1";
-      std::vector<unsigned char> put_resp;
-      int put_status = 0;
-      if (http_request(cfg, "PUT", path.str(), bytes, put_status, put_resp) && put_status == 200) {
-        logs.push_back(id + ": UPLOADED");
-      } else {
-        logs.push_back(id + ": ERROR(upload)");
-      }
-    }
-  }
+  const std::string plat = "switch-homebrew";
 
   if (action == SyncAction::UploadOnly) {
+    for (const auto& entry : local_by_id) {
+      if (xy_filter && !xy_filter->all && !xy_filter->ids.count(entry.first)) continue;
+      if (put_save_log(cfg, entry.second, true, plat, logs))
+        baseline_upsert(baseline, entry.first, entry.second.sha256);
+    }
+    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .savesync-baseline");
     return logs;
   }
 
-  if (action == SyncAction::Auto) {
-    body.clear();
-    if (!http_request(cfg, "GET", "/saves", {}, status, body) || status != 200) {
-      if (status > 0) {
-        logs.push_back("ERROR: refresh GET /saves failed (HTTP " + std::to_string(status) + ")");
-      } else {
-        logs.push_back("ERROR: refresh GET /saves failed (network/connect)");
+  if (action == SyncAction::DownloadOnly) {
+    for (const auto& [id, r] : remote) {
+      if (xy_filter && !xy_filter->all && !xy_filter->ids.count(id)) continue;
+      if (get_save_log(cfg, id, r, logs)) baseline_upsert(baseline, id, r.sha256);
+    }
+    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .savesync-baseline");
+    return logs;
+  }
+
+  /* Auto: hash + .savesync-baseline (same model as 3DS). */
+  debug_report_sync_start_switch(cfg, local);
+  std::vector<std::string> merge_ids;
+  merge_ids.reserve(local_by_id.size() + remote.size());
+  for (const auto& [id, _] : local_by_id) merge_ids.push_back(id);
+  for (const auto& [id, _] : remote) {
+    if (!local_by_id.count(id)) merge_ids.push_back(id);
+  }
+
+  for (const std::string& id : merge_ids) {
+    auto lit = local_by_id.find(id);
+    auto rit = remote.find(id);
+    const bool has_l = lit != local_by_id.end();
+    const bool has_r = rit != remote.end();
+
+    if (has_l && has_r) {
+      const LocalSave& l = lit->second;
+      const SaveMeta& r = rit->second;
+      if (l.sha256 == r.sha256) {
+        logs.push_back(id + ": OK");
+        baseline_upsert(baseline, id, l.sha256);
+        continue;
       }
-      return logs;
+      std::string base_sha;
+      if (!baseline_get_sha(baseline, id, &base_sha)) {
+        logs.push_back(
+            id +
+            ": SKIP (no baseline yet — use X or Y once per game, then Auto works)");
+        continue;
+      }
+      const bool loc_eq = (strcasecmp(l.sha256.c_str(), base_sha.c_str()) == 0);
+      const bool rem_eq = (strcasecmp(r.sha256.c_str(), base_sha.c_str()) == 0);
+      if (loc_eq && !rem_eq) {
+        if (get_save_log(cfg, id, r, logs)) baseline_upsert(baseline, id, r.sha256);
+      } else if (!loc_eq && rem_eq) {
+        if (put_save_log(cfg, l, false, plat, logs)) baseline_upsert(baseline, id, l.sha256);
+      } else if (!loc_eq && !rem_eq) {
+        if (pad) {
+          resolve_both_changed_conflict_switch(pad, cfg, id, l, r, plat, logs, baseline);
+        } else {
+          logs.push_back(id + ": SKIP (both changed — need interactive resolution)");
+        }
+      }
+    } else if (has_l && !has_r) {
+      if (put_save_log(cfg, lit->second, false, plat, logs))
+        baseline_upsert(baseline, id, lit->second.sha256);
+    } else if (!has_l && has_r) {
+      if (get_save_log(cfg, id, rit->second, logs)) baseline_upsert(baseline, id, rit->second.sha256);
     }
-    json.assign(body.begin(), body.end());
-    remote = parse_saves_json(json);
   }
 
-  for (const auto& [id, r] : remote) {
-    std::string fallback_name = id + ".sav";
-    std::string target_name = r.filename_hint.empty() ? fallback_name : sanitize_filename(r.filename_hint, fallback_name);
-    if (!has_sav_extension(target_name)) target_name += ".sav";
-    const std::string target_path = cfg.save_dir + "/" + target_name;
-
-    std::vector<unsigned char> save_data;
-    int get_status = 0;
-    if (!http_request(cfg, "GET", "/save/" + id, {}, get_status, save_data) || get_status != 200) {
-      logs.push_back(id + ": ERROR(download)");
-      continue;
-    }
-    if (write_atomic(target_path, save_data)) {
-      logs.push_back(id + ": DOWNLOADED");
-    } else {
-      logs.push_back(id + ": ERROR(write)");
-    }
-  }
+  if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .savesync-baseline");
   return logs;
 }
 
@@ -552,6 +1120,47 @@ static bool choose_action(PadState* pad, SyncAction* out_action) {
   return false;
 }
 
+static bool confirm_auto_sync(PadState* pad) {
+  printf("\n--- Confirm (full sync) ---\n");
+  printf("Uses .savesync-baseline hashes (not SD mtimes).\n");
+  printf("Both-changed conflicts: X or Y on prompt. B skips.\n\n");
+  printf("A: continue   B: back to main menu\n\n");
+
+  /* Idle out the main-menu press; + was being read as cancel on this screen. */
+  constexpr u64 kSyncMask =
+      HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y | HidNpadButton_Plus;
+  while (appletMainLoop()) {
+    padUpdate(pad);
+    (void)padGetButtonsDown(pad);
+    if ((padGetButtons(pad) & kSyncMask) == 0) break;
+    consoleUpdate(NULL);
+  }
+
+  while (appletMainLoop()) {
+    padUpdate(pad);
+    const u64 down = padGetButtonsDown(pad);
+    if (down & HidNpadButton_A) return true;
+    if (down & HidNpadButton_B) return false;
+    consoleUpdate(NULL);
+  }
+  return false;
+}
+
+static void wait_after_sync_switch(PadState* pad, bool* quit_app) {
+  printf("\nA: main menu   +: exit app\n");
+  while (appletMainLoop()) {
+    padUpdate(pad);
+    const u64 down = padGetButtonsDown(pad);
+    if (down & HidNpadButton_A) return;
+    if (down & HidNpadButton_Plus) {
+      *quit_app = true;
+      return;
+    }
+    consoleUpdate(NULL);
+  }
+  *quit_app = true;
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -562,10 +1171,6 @@ int main(int argc, char** argv) {
   padInitializeDefault(&pad);
 
   Config cfg = load_config("sdmc:/switch/gba-sync/config.ini");
-  printf("GBA Sync (Switch MVP)\n");
-  printf("---------------------\n");
-  printf("Server: %s\n", cfg.server_url.empty() ? "(missing config)" : cfg.server_url.c_str());
-  printf("Save dir: %s\n\n", cfg.save_dir.c_str());
 
   std::vector<std::string> logs;
   if (R_FAILED(sock_rc)) {
@@ -575,13 +1180,35 @@ int main(int argc, char** argv) {
   } else if (cfg.server_url.rfind("http://", 0) != 0) {
     logs.push_back("ERROR: use http:// URL for Switch MVP");
   } else {
-    printf("A: full sync   X: upload only   Y: download only\n");
-    printf("Press + to cancel.\n\n");
-    SyncAction action = SyncAction::Auto;
-    if (choose_action(&pad, &action)) {
-      logs = run_sync(cfg, action);
-    } else {
-      logs.push_back("Cancelled.");
+    bool quit_app = false;
+    while (appletMainLoop() && !quit_app) {
+      consoleClear();
+      printf("GBA Sync (Switch MVP)\n");
+      printf("---------------------\n");
+      printf("Server: %s\n", cfg.server_url.c_str());
+      printf("Save dir: %s\n\n", cfg.save_dir.c_str());
+      printf("A: full sync   X: upload only   Y: download only\n\n");
+      printf("+ on this menu exits the app.\n\n");
+
+      SyncAction action = SyncAction::Auto;
+      if (!choose_action(&pad, &action)) break;
+
+      if (action == SyncAction::Auto && !confirm_auto_sync(&pad)) continue;
+
+      SyncManualFilter xy{};
+      xy.all = true;
+      std::vector<std::string> sync_logs;
+      if (action == SyncAction::UploadOnly) {
+        if (!pick_upload_selection(&pad, cfg, &xy)) continue;
+        sync_logs = run_sync(cfg, action, &xy, &pad);
+      } else if (action == SyncAction::DownloadOnly) {
+        if (!pick_download_selection(&pad, cfg, &xy)) continue;
+        sync_logs = run_sync(cfg, action, &xy, &pad);
+      } else {
+        sync_logs = run_sync(cfg, action, nullptr, &pad);
+      }
+      for (const auto& line : sync_logs) printf("%s\n", line.c_str());
+      wait_after_sync_switch(&pad, &quit_app);
     }
   }
   for (const auto& line : logs) printf("%s\n", line.c_str());

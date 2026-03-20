@@ -21,6 +21,8 @@ Use this checklist for real-device validation on Switch + 3DS + Delta.
 
 - [ ] Install `gbasync.nro` and config
 - [ ] Run app and confirm no config/network error
+- [ ] Full sync: confirm screen — **A** continues, **B** returns to menu (**+** should not cancel confirm)
+- [ ] After sync: **done** screen — **A** returns to menu, **+** exits app
 - [ ] Save in Switch-side emulator, then run upload-only sync (`X`)
 - [ ] Confirm server metadata hash/platform_source updates
 - [ ] Pull same save on bridge/Delta and verify progress
@@ -29,6 +31,7 @@ Use this checklist for real-device validation on Switch + 3DS + Delta.
 
 - [ ] Install `gbasync.3dsx` and config
 - [ ] Run app and confirm no config/network error
+- [ ] After sync: **done** screen — **A** returns to menu, **START** exits app
 - [ ] Save in 3DS-side emulator, then run upload-only sync (`X`)
 - [ ] Confirm server metadata hash/platform_source updates
 - [ ] Pull same save on bridge/Delta and verify progress
@@ -49,6 +52,7 @@ Use this checklist for real-device validation on Switch + 3DS + Delta.
 
 ## Stage 6 - Regression checks
 
+- [ ] Optional: remove a test `game_id` with `DELETE /save/{game_id}` and confirm it disappears from `GET /saves`
 - [ ] Restart server and verify data persists
 - [ ] Re-run bridge `--watch` for at least 5 minutes
 - [ ] Reboot console and run sync again

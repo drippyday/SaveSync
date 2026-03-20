@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from .auth import require_api_key
 from .models import SaveListResponse, SaveMeta
@@ -26,6 +28,19 @@ store = SaveStore(
 )
 
 app = FastAPI(title="SaveSync Server", version="0.1.0")
+
+_log = logging.getLogger("savesync")
+
+
+def _client_debug_logging_enabled() -> bool:
+    return os.getenv("SAVE_SYNC_LOG_CLIENT_DEBUG", "").lower() in ("1", "true", "yes")
+
+
+class ClientDebugReport(BaseModel):
+    utc_iso: str
+    platform: str = "unknown"
+    phase: str = ""
+    untrusted_local_saves: int = 0
 
 
 @app.get("/health")
@@ -59,6 +74,13 @@ def get_save(game_id: str) -> Response:
     return Response(content=data, media_type="application/octet-stream")
 
 
+@app.post("/debug/client-clock", dependencies=[Depends(require_api_key)])
+def client_debug_clock(report: ClientDebugReport) -> dict[str, bool]:
+    if _client_debug_logging_enabled():
+        _log.info("client_debug_report %s", report.model_dump())
+    return {"ok": True}
+
+
 @app.put("/save/{game_id}", dependencies=[Depends(require_api_key)])
 def put_save(
     game_id: str,
@@ -68,8 +90,20 @@ def put_save(
     size_bytes: int = Query(...),
     filename_hint: str | None = Query(default=None),
     platform_source: str | None = Query(default=None),
+    client_clock_utc: str | None = Query(
+        default=None,
+        description="Client wall clock at upload time (for debugging vs last_modified_utc)",
+    ),
     force: bool = Query(default=False),
 ) -> JSONResponse:
+    if _client_debug_logging_enabled() and client_clock_utc:
+        _log.info(
+            "put_save client_clock game_id=%s last_modified_utc=%s client_clock_utc=%s platform_source=%s",
+            game_id,
+            last_modified_utc,
+            client_clock_utc,
+            platform_source,
+        )
     meta = SaveMeta(
         game_id=game_id,
         last_modified_utc=last_modified_utc,
@@ -83,7 +117,7 @@ def put_save(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="size_bytes mismatch")
 
     try:
-        effective, conflict = store.upsert(game_id, body, meta, force=force)
+        effective, conflict, applied = store.upsert(game_id, body, meta, force=force)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -92,6 +126,7 @@ def put_save(
         content={
             "game_id": game_id,
             "saved": True,
+            "applied": applied,
             "conflict": conflict,
             "effective_meta": effective.model_dump(),
         },
@@ -104,3 +139,16 @@ def resolve_conflict(game_id: str) -> JSONResponse:
     if not resolved:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Save not found")
     return JSONResponse(status_code=200, content={"game_id": game_id, "resolved": True})
+
+
+@app.delete("/save/{game_id}", dependencies=[Depends(require_api_key)])
+def delete_save(game_id: str) -> JSONResponse:
+    """
+    Remove server metadata for ``game_id`` and delete the stored .sav blob.
+    Use this when test uploads or stale index rows should disappear from ``GET /saves``.
+    """
+    if not game_id or "/" in game_id or "\\" in game_id or game_id.startswith("."):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid game_id")
+    if not store.remove(game_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Save not in index")
+    return JSONResponse(status_code=200, content={"game_id": game_id, "deleted": True})

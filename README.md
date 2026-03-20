@@ -42,6 +42,8 @@ cp .env.example .env
 docker compose up -d
 ```
 
+With Docker, binary saves and `index.json` live in **`save_data/`** at the repo root (see `server/docker-compose.yml`).
+
 Health check:
 
 ```bash
@@ -78,7 +80,7 @@ Then use:
 ## Documentation
 
 - `USER_GUIDE.md`: full setup and usage guide
-- `VC_WORKFLOW.md`: step-by-step VC inject export/sync/import guide
+- `TODO.md`: recently shipped items vs backlog
 - `RELEASE.md`: packaging and release workflow
 - `dist/README.md`: dist artifact glossary and install pointers
 - `server/README.md`: server API and run details
@@ -98,19 +100,17 @@ This verifies upload and download flow in an isolated temp directory.
 
 ## Key Behaviors
 
-- Console uploads force-overwrite server saves (`force=1`)
-- Console downloads overwrite local save files with remote content
-- Conflict detection when hashes differ at same timestamp
-- Atomic file writes for safer save replacement
-- Optional version-history backups on server
-- Bridge supports ROM-header-based `game_id` derivation when ROM paths are configured
-- 3DS client supports `mode=normal` and `mode=vc` save source selection in config
+- **A / full sync (Auto):** Uses **SHA-256** plus **`.savesync-baseline`** on the device (same idea on Switch and 3DS). First time a `game_id` has no baseline row, Auto logs **SKIP (no baseline yet)** until you run **upload-only** or **download-only** once for that game. **Switch** asks for confirm (**A** continue, **B** back; **+** is not cancel on that screen). After any sync run, **Switch** shows **A** = main menu / **+** = exit; **3DS** shows **A** = main menu / **START** = exit app.
+- **X / upload-only** and **Y / download-only:** checklist UI (**ALL SAVES** or per-game); force upload or download for picks (Switch: **+** to run, **B** back; 3DS: **START** / **R** / **X** or **Y** to run, **B** back).
+- **Conflicts:** when local and server both diverged from baseline, a **Conflict** prompt (**X** / **Y** / **B**) on Switch and 3DS.
+- **`GET /saves`** on the server comes from **`index.json`**, not from re-scanning the save folder; **`DELETE /save/{game_id}`** cleans index + blob. See `server/README.md` and `USER_GUIDE.md`.
+- ROM-header-based **`game_id`** when `[rom]` is configured (bridge, Switch, 3DS); otherwise normalized save stem.
+- Atomic local writes; optional server version history; API-key auth.
 
 ## MVP Limitations
 
-- Switch/3DS clients currently use `http://` (no TLS path yet)
-- Switch/3DS game identity is filename-derived in current MVP
-- Console sync is foreground/manual (not background service)
+- Switch/3DS clients use plain **`http://`** (no TLS in this path yet)
+- Console sync is foreground/manual (not a background service)
 
 ## Toolchain Requirements (for building clients)
 
@@ -120,14 +120,9 @@ This verifies upload and download flow in an isolated temp directory.
   - `devkitA64` + `libnx` (Switch)
   - `devkitARM` + `libctru` (3DS)
 
-## Contributing / Next Work
+## Contributing / next work
 
-Planned improvements:
-
-- ROM-header-based `game_id` normalization
-- HTTPS support for console clients
-- richer conflict resolution UX
-- telemetry/log rotation and deeper integration tests
+See **`TODO.md`** for backlog. Broad themes: HTTPS on consoles, optional confirms for X/Y modes, deeper tests, and optional background sync.
 
 ## License
 

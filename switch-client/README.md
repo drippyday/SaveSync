@@ -6,15 +6,16 @@ Nintendo Switch homebrew sync client using libnx and socket-based HTTP.
 
 1. Config parsing from `sdmc:/switch/gba-sync/config.ini`
 2. Local `.sav` scan from `sdmc:/roms/gba/saves` (configurable)
-3. HTTP sync operations:
+3. Optional **ROM-header** `game_id` when `[rom]` paths are set (else normalized stem)
+4. HTTP sync operations:
    - `GET /saves`
-   - `GET /save/{game_id}`
-   - `PUT /save/{game_id}`
-4. Explicit overwrite sync actions:
-   - Upload paths always force-overwrite server saves (`force=1`)
-   - Download paths overwrite local save files
-5. Atomic write for downloaded saves
-6. Console UI sync status output
+   - `GET /save/{game_id}` (+ `/meta`)
+   - `PUT /save/{game_id}` (`force=1` on uploads from this client)
+5. **Auto (A):** baseline file **`.savesync-baseline`** + SHA-256 (not SD mtime policy); first-run **SKIP** until X/Y seeds baseline; **Conflict** UI (X/Y/B)
+6. **Upload (X)** / **download (Y)** pickers with checklist; **+** runs, **B** back
+7. **Full-sync confirm:** **A** continue, **B** back (**+** intentionally not cancel on that screen)
+8. **Post-sync:** **A** main menu, **+** exit app
+9. Atomic write for downloaded saves; resilient HTTP parsing (chunked bodies, `Accept-Encoding: identity`, etc.)
 
 ## Example config
 

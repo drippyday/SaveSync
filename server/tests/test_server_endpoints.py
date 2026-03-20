@@ -71,3 +71,30 @@ def test_conflict_list_and_resolve(tmp_path: Path) -> None:
     assert conflicts_after.status_code == 200
     ids_after = [item["game_id"] for item in conflicts_after.json()["saves"]]
     assert "zelda" not in ids_after
+
+
+def test_delete_save(tmp_path: Path) -> None:
+    client = _make_client(tmp_path)
+    data = b"x"
+    sha = hashlib.sha256(data).hexdigest()
+    params = {
+        "last_modified_utc": "2026-03-17T21:00:00+00:00",
+        "sha256": sha,
+        "size_bytes": len(data),
+        "filename_hint": "t.sav",
+        "platform_source": "test",
+    }
+    assert client.put("/save/stale-test", params=params, content=data, headers=_auth_headers()).status_code == 200
+    assert (tmp_path / "saves" / "stale-test.sav").is_file()
+
+    deleted = client.delete("/save/stale-test", headers=_auth_headers())
+    assert deleted.status_code == 200
+    assert not (tmp_path / "saves" / "stale-test.sav").exists()
+
+    listed = client.get("/saves", headers=_auth_headers())
+    assert listed.status_code == 200
+    ids = [item["game_id"] for item in listed.json()["saves"]]
+    assert "stale-test" not in ids
+
+    missing = client.delete("/save/stale-test", headers=_auth_headers())
+    assert missing.status_code == 404

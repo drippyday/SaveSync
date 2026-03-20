@@ -5,6 +5,13 @@ services:
       - "8080:8080"
     env_file:
       - .env
+    # .env uses ./data/... for local uvicorn; in the container that resolves to /app/data and
+    # ignores this bind mount. Force /data paths so the host volume maps to real storage.
+    environment:
+      SAVE_ROOT: /data/saves
+      HISTORY_ROOT: /data/history
+      INDEX_PATH: /data/index.json
     volumes:
-      - ./data:/data
+      # Repo root save_data/ (compose file lives in server/)
+      - ../save_data:/data
     restart: unless-stopped

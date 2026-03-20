@@ -20,7 +20,10 @@ FastAPI backend for binary save storage and metadata coordination.
 - `GET /save/{game_id}/meta`
 - `GET /save/{game_id}`
 - `PUT /save/{game_id}`
+- `DELETE /save/{game_id}` — remove index row and delete the stored blob (cleanup / bad test data)
 - `POST /resolve/{game_id}`
+
+`GET /saves` is driven by the **metadata index** (`INDEX_PATH`, e.g. `save_data/index.json`), not by re-scanning the save folder. Curl uploads register rows there; deleting local test files does **not** remove server metadata. Use `DELETE` or edit the index JSON if entries outlive the files.
 
 ## Run
 
@@ -38,6 +41,12 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 curl -X PUT "http://127.0.0.1:8080/save/pokemon-emerald?last_modified_utc=2026-03-17T21:00:00%2B00:00&sha256=<sha>&size_bytes=131072&filename_hint=Pokemon%20Emerald.sav&platform_source=delta-bridge" \
   -H "X-API-Key: change-me" \
   --data-binary @Pokemon\ Emerald.sav
+```
+
+Delete a save from the index (and remove `pokemon-emerald.sav` under `SAVE_ROOT`):
+
+```bash
+curl -X DELETE "http://127.0.0.1:8080/save/pokemon-emerald" -H "X-API-Key: change-me"
 ```
 
 Force-overwrite example:

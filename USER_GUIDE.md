@@ -17,6 +17,8 @@ cp .env.example .env
 docker compose up -d
 ```
 
+Saves and the metadata index are stored on the host under **`save_data/`** at the **repository root** (for example `save_data/saves/*.sav` and `save_data/index.json`), bind-mounted into the container—not under `server/`.
+
 Verify:
 
 ```bash
@@ -109,7 +111,13 @@ rom_dir=sdmc:/roms/gba
 rom_extension=.gba
 ```
 
-Launch from Homebrew Menu and press `+` to exit.
+Launch from Homebrew Menu.
+
+**Main menu:** **A** full sync, **X** upload-only, **Y** download-only, **+** exits the app.
+
+**Full sync** opens a **confirm** screen: **A** runs Auto sync, **B** returns to the menu (**+** does not cancel here — avoids accidental backs).
+
+After logs finish, a **done** screen appears: **A** returns to the main menu; **+** exits the app.
 
 Expected in-app output example:
 
@@ -148,7 +156,13 @@ rom_dir=sdmc:/roms/gba
 rom_extension=.gba
 ```
 
-Launch from Homebrew Launcher and press `START` to exit.
+Launch from Homebrew Launcher.
+
+**Main menu:** **A** / **X** / **Y** as labeled; **START** exits to the “Press START to exit” end screen (or exits immediately if you already chose **START** on the post-sync screen).
+
+**Full sync** uses a **confirm** screen (**A** continue, **B** / **START** back to menu — same pattern as other confirms in the app).
+
+After sync logs, a **done** screen appears: **A** returns to the main menu; **START** exits the app (skips the duplicate exit prompt).
 
 3DS mode options:
 
@@ -167,8 +181,6 @@ Use this cycle:
 5. Export/pull latest save back into `vc_save_dir`.
 6. Import save back into VC title via save manager.
 
-See `VC_WORKFLOW.md` for a full step-by-step guide.
-
 Expected in-app output example:
 
 ```text
@@ -181,8 +193,13 @@ pokemon-emerald: DOWNLOADED
 ## 5) Validate cross-device sync
 
 1. Run one client (Delta/Switch/3DS) and make save progress.
-2. On the source console, press upload-only (`X`) to push saves to server.
-3. On the destination console, press download-only (`Y`) to pull saves from server.
+2. On a console with newer progress, press **`A`** (full sync): **Switch** and **3DS** both use each game’s save **SHA256** and a small **`.savesync-baseline`** file next to your `.sav` files (unreliable SD modification times are not used for merge decisions on either console). Or use upload-only (`X`) to force-push chosen saves.
+3. On the other console, press **`A`** again or download-only (`Y`) to pull saves from the server.
+
+The first time a game has no baseline row yet, full sync logs **SKIP (no baseline yet)** — use **`X`** or **`Y`** once for that game so Auto can track changes afterward. If **local and server both diverged** from the last known baseline, **3DS** and **Switch** show a **Conflict** screen: **`X`** uploads local (with force), **`Y`** downloads from server, **`B`** skips for now.
+
+After a run, read the on-screen log, then use the **done** prompt (**A** / **+** on Switch; **A** / **START** on 3DS) so the menu does not clear immediately.
+
 4. Confirm same progress appears on second client.
 5. Verify metadata via:
 
@@ -196,15 +213,28 @@ Quick local smoke test (server + bridge only):
 ./scripts/smoke-sync.sh
 ```
 
-## 6) Common issues
+## 6) Server index vs files (`index.json`)
+
+The server’s **`GET /saves`** list is driven by the **metadata index** (default host path **`save_data/index.json`** when using repo Docker layout), not by scanning `save_data/saves/` alone. Uploads (curl, bridge, consoles) **register rows** in that index.
+
+If you **delete local test `.sav` files** or remove blobs on disk but leave the index alone, clients can still **see** those `game_id`s and hit **404** or upload errors until you:
+
+- Call **`DELETE /save/{game_id}`** (API key required), or  
+- Manually edit **`index.json`** and remove the stale keys (and delete orphaned `*.sav` if any).
+
+See **`server/README.md`** for the `DELETE` curl example.
+
+## 7) Common issues
 
 - **401 unauthorized**: API key mismatch.
 - **No saves found**: wrong `save_dir`, missing `.sav` files.
 - **Cannot connect**: wrong server IP/port or firewall block.
 - **No cross-device update**: use `X` on source device, then `Y` on destination device.
 - **Conflicts**: check `GET /conflicts`, resolve via `POST /resolve/{game_id}`.
+- **“Ghost” saves after tests**: stale **`index.json`** rows — use **`DELETE /save/{game_id}`** or edit the index.
+- **Switch confirm goes to menu**: use **A** to confirm; **B** backs out; do not expect **+** to cancel on the confirm screen.
 
-## 7) Game ID normalization
+## 8) Game ID normalization
 
 Bridge game ID resolution order:
 
@@ -217,13 +247,13 @@ To improve cross-device matching accuracy, set in bridge config:
 - `rom_map_path`: optional JSON map `{ "Save File Stem": "/full/path/to/ROM.gba" }`
 - `rom_extensions`: ROM extensions for auto-matching (default `[".gba"]`)
 
-## 8) Current MVP limits
+## 9) Current MVP limits
 
-- Switch/3DS clients currently use HTTP.
-- Switch/3DS clients still derive `game_id` from filename (bridge is now ROM-header-aware).
+- Switch/3DS clients use **HTTP** only in this repo path (no TLS).
+- **`game_id`:** ROM header when `[rom]` paths are set on the console config; otherwise normalized save stem (same idea as the bridge).
 - Console sync is manual (app-triggered), not background.
 
-## 9) Dist artifact reference
+## 10) Dist artifact reference
 
 ### `dist/server`
 

@@ -5,17 +5,17 @@ Nintendo 3DS homebrew sync client using socket-based HTTP with libctru networkin
 ## Implemented features
 
 1. Config parsing from `sdmc:/3ds/gba-sync/config.ini`
-2. Local `.sav` scanning from configurable save directory
-3. HTTP sync operations:
+2. Local `.sav` scanning from configurable save directory (`mode=normal` or `mode=vc`)
+3. ROM-header-based **`game_id`** when `[rom]` paths are configured (else normalized stem)
+4. HTTP sync operations:
    - `GET /saves`
-   - `GET /save/{game_id}`
-   - `PUT /save/{game_id}`
-4. Explicit overwrite sync actions:
-   - Upload paths always force-overwrite server saves (`force=1`)
-   - Download paths overwrite local save files
-5. Atomic write safety for downloaded saves
-6. Bottom-screen status output
-7. ROM-header-based `game_id` derivation when ROM settings are configured
+   - `GET /save/{game_id}` (+ `/meta`)
+   - `PUT /save/{game_id}` (`force=1` on uploads from this client)
+5. **Auto (A):** **`.savesync-baseline`** + SHA-256 policy; first-run **SKIP** until X/Y seeds baseline; **Conflict** UI (X/Y/B)
+6. **Upload** / **download** pickers; **START** / **R** / **X** or **Y** to run batch, **B** back
+7. **Full-sync confirm** (A / B / START per on-screen copy)
+8. **Post-sync:** **A** main menu, **START** exit app (skips second exit prompt)
+9. Atomic writes; bottom-screen UI; resilient HTTP (chunked / encoding / JSON tolerance)
 
 ## Example config
 

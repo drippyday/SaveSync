@@ -34,3 +34,7 @@
 - [x] Add integration tests for conflict and interrupted-write-adjacent handling
 - [x] Add optional conflict resolution endpoint
 - [x] Add release packaging docs for each target
+- [x] Console Auto sync: **`.savesync-baseline`** + SHA-256 merge policy (Switch + 3DS)
+- [x] Conflict UX on consoles; HTTP client robustness (chunked / encoding / JSON tolerance)
+- [x] Switch full-sync confirm + post-sync navigation; 3DS post-sync navigation
+- [x] Server **`DELETE /save/{game_id}`** + documentation for **`index.json`** vs filesystem

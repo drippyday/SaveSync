@@ -88,9 +88,11 @@ class SaveStore:
         history_path = self.history_dir(game_id) / f"{stamp}-{existing_meta.sha256[:8]}.sav"
         shutil.copy2(existing_file, history_path)
 
-    def upsert(self, game_id: str, data: bytes, incoming: SaveMeta, force: bool = False) -> tuple[SaveMeta, bool]:
+    def upsert(self, game_id: str, data: bytes, incoming: SaveMeta, force: bool = False) -> tuple[SaveMeta, bool, bool]:
         """
-        Returns: (effective_meta, conflict_detected)
+        Returns: (effective_meta, conflict_detected, applied_to_disk)
+
+        ``applied_to_disk`` is False when the incoming payload was not written (no-op).
         """
         computed = hashlib.sha256(data).hexdigest()
         if computed != incoming.sha256:
@@ -112,9 +114,13 @@ class SaveStore:
                         conflict = True
                         incoming.conflict = True
 
-                    # older upload does not replace newer remote.
+                    # Client-claimed time older than index (common: handheld clock behind docked Switch).
+                    # Same bytes: no-op. Different bytes: accept payload and re-stamp with server time so
+                    # ordering matches reality (avoids silent 200 + no write + clients desyncing baselines).
                     if incoming_time < existing_time:
-                        return existing, conflict
+                        if existing.sha256 == incoming.sha256:
+                            return existing, conflict, False
+                        incoming.last_modified_utc = utc_now_iso()
 
                 self._backup_existing(game_id, existing)
 
@@ -127,7 +133,7 @@ class SaveStore:
             incoming.version = (existing.version + 1) if existing else 1
             index[game_id] = incoming.model_dump(exclude={"game_id"})
             self._write_index(index)
-            return incoming, conflict
+            return incoming, conflict, True
 
     def resolve_conflict(self, game_id: str) -> bool:
         with self._lock:
@@ -141,3 +147,16 @@ class SaveStore:
             index[game_id] = raw
             self._write_index(index)
             return True
+
+    def remove(self, game_id: str) -> bool:
+        """Drop ``game_id`` from the index and delete ``{game_id}.sav`` if present."""
+        with self._lock:
+            index = self._read_index()
+            if game_id not in index:
+                return False
+            del index[game_id]
+            self._write_index(index)
+        path = self.save_path(game_id)
+        if path.is_file():
+            path.unlink()
+        return True
