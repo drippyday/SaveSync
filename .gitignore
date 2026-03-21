@@ -6,3 +6,4 @@ server/data/
 save_data/
 dist/
 .tmp/
+.env

@@ -25,10 +25,10 @@
 #include <vector>
 
 struct Config {
-  std::string server_url;
-  std::string api_key;
-  std::string save_dir = "sdmc:/roms/gba/saves";
-  std::string rom_dir;
+  std::string server_url = "http://10.0.0.151:8080";
+  std::string api_key = "change-me";
+  std::string save_dir = "sdmc:/mGBA";
+  std::string rom_dir = "sdmc:/mGBA";
   std::string rom_extension = ".gba";
 };
 
@@ -56,10 +56,16 @@ struct BaselineRow {
   std::string sha256;
 };
 
+struct IdMapRow {
+  std::string save_stem;
+  std::string game_id;
+};
+
 enum class SyncAction {
   Auto,
   UploadOnly,
   DownloadOnly,
+  DropboxSync,
 };
 
 struct SyncManualFilter {
@@ -564,23 +570,90 @@ static std::string mtime_to_utc_iso(time_t mtime) {
   return std::string(buf);
 }
 
+static std::string id_map_file_path(const std::string& dir) {
+  std::string d = dir;
+  while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+  return d + "/.gbasync-idmap";
+}
+
+static std::vector<IdMapRow> id_map_load(const std::string& dir) {
+  std::vector<IdMapRow> rows;
+  std::ifstream in(id_map_file_path(dir));
+  std::string line;
+  while (rows.size() < 1024 && std::getline(in, line)) {
+    const auto tab = line.find('\t');
+    if (tab == std::string::npos) continue;
+    std::string stem = line.substr(0, tab);
+    std::string gid = line.substr(tab + 1);
+    while (!gid.empty() && (gid.back() == '\r' || gid.back() == '\n')) gid.pop_back();
+    if (stem.empty() || gid.empty()) continue;
+    rows.push_back({std::move(stem), std::move(gid)});
+  }
+  return rows;
+}
+
+static bool id_map_save(const std::string& dir, const std::vector<IdMapRow>& rows) {
+  const std::string path = id_map_file_path(dir);
+  const std::string tmp = path + ".tmp";
+  std::ofstream out(tmp);
+  if (!out) return false;
+  for (const auto& r : rows) out << r.save_stem << '\t' << r.game_id << '\n';
+  out.close();
+  std::remove(path.c_str());
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    std::remove(tmp.c_str());
+    return false;
+  }
+  return true;
+}
+
+static std::string id_map_lookup(const std::vector<IdMapRow>& rows, const std::string& stem) {
+  for (const auto& r : rows) {
+    if (r.save_stem == stem) return r.game_id;
+  }
+  return "";
+}
+
+static bool id_map_upsert(std::vector<IdMapRow>& rows, const std::string& stem, const std::string& gid) {
+  for (auto& r : rows) {
+    if (r.save_stem == stem) {
+      if (r.game_id == gid) return false;
+      r.game_id = gid;
+      return true;
+    }
+  }
+  rows.push_back({stem, gid});
+  return true;
+}
+
 static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::string& dir) {
   std::vector<LocalSave> out;
   std::map<std::string, int> used_ids;
+  std::vector<IdMapRow> id_map = id_map_load(dir);
+  bool id_map_changed = false;
+  std::vector<std::string> names;
   DIR* d = opendir(dir.c_str());
   if (!d) return out;
   dirent* ent = nullptr;
   while ((ent = readdir(d)) != nullptr) {
     std::string name(ent->d_name);
     if (name == "." || name == ".." || !has_sav_extension(name)) continue;
+    names.push_back(name);
+  }
+  closedir(d);
+  std::sort(names.begin(), names.end());
+
+  for (const auto& name : names) {
     LocalSave s{};
     s.name = name;
     s.path = dir + "/" + name;
+    const std::string stem = file_stem(name);
+    const std::string mapped_id = id_map_lookup(id_map, stem);
     const std::string resolved_id = resolve_game_id_for_save(cfg, name);
-    const std::string fallback_id = sanitize_game_id(file_stem(name));
-    std::string chosen_id = resolved_id.empty() ? fallback_id : resolved_id;
+    const std::string fallback_id = sanitize_game_id(stem);
+    std::string chosen_id = mapped_id.empty() ? (resolved_id.empty() ? fallback_id : resolved_id) : mapped_id;
     if (used_ids.find(chosen_id) != used_ids.end()) {
-      // Avoid local collisions when multiple ROMs share the same header ID.
+      // Ensure unique IDs per local save even when ROM headers collide.
       std::string base = fallback_id.empty() ? chosen_id : fallback_id;
       if (base.empty()) base = "unknown-game";
       chosen_id = base;
@@ -589,6 +662,7 @@ static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::str
         chosen_id = base + "-" + std::to_string(suffix++);
       }
     }
+    id_map_changed = id_map_upsert(id_map, stem, chosen_id) || id_map_changed;
     used_ids[chosen_id] = 1;
     s.game_id = chosen_id;
     struct stat st{};
@@ -607,11 +681,17 @@ static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::str
     s.sha256 = sha256_impl::hash(bytes);
     out.push_back(s);
   }
-  closedir(d);
+  if (id_map_changed) (void)id_map_save(dir, id_map);
   return out;
 }
 
 static std::string baseline_file_path(const Config& cfg) {
+  std::string d = cfg.save_dir;
+  while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+  return d + "/.gbasync-baseline";
+}
+
+static std::string baseline_legacy_file_path(const Config& cfg) {
   std::string d = cfg.save_dir;
   while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
   return d + "/.savesync-baseline";
@@ -620,6 +700,7 @@ static std::string baseline_file_path(const Config& cfg) {
 static std::vector<BaselineRow> baseline_load(const Config& cfg) {
   std::vector<BaselineRow> rows;
   std::ifstream in(baseline_file_path(cfg));
+  if (!in) in.open(baseline_legacy_file_path(cfg));
   std::string line;
   while (rows.size() < 256 && std::getline(in, line)) {
     const auto tab = line.find('\t');
@@ -644,6 +725,16 @@ static bool baseline_save(const Config& cfg, const std::vector<BaselineRow>& row
   if (std::rename(tmp.c_str(), path.c_str()) != 0) {
     std::remove(tmp.c_str());
     return false;
+  }
+  // Keep the legacy baseline file in sync so older client builds continue to work.
+  const std::string legacy_path = baseline_legacy_file_path(cfg);
+  const std::string legacy_tmp = legacy_path + ".tmp";
+  std::ofstream legacy_out(legacy_tmp);
+  if (legacy_out) {
+    for (const auto& r : rows) legacy_out << r.game_id << '\t' << r.sha256 << '\n';
+    legacy_out.close();
+    std::remove(legacy_path.c_str());
+    if (std::rename(legacy_tmp.c_str(), legacy_path.c_str()) != 0) std::remove(legacy_tmp.c_str());
   }
   return true;
 }
@@ -1028,7 +1119,7 @@ static std::vector<std::string> run_sync(
       if (put_save_log(cfg, entry.second, true, plat, logs))
         baseline_upsert(baseline, entry.first, entry.second.sha256);
     }
-    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .savesync-baseline");
+    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .gbasync-baseline");
     return logs;
   }
 
@@ -1037,11 +1128,11 @@ static std::vector<std::string> run_sync(
       if (xy_filter && !xy_filter->all && !xy_filter->ids.count(id)) continue;
       if (get_save_log(cfg, id, r, logs)) baseline_upsert(baseline, id, r.sha256);
     }
-    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .savesync-baseline");
+    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .gbasync-baseline");
     return logs;
   }
 
-  /* Auto: hash + .savesync-baseline (same model as 3DS). */
+  /* Auto: hash + .gbasync-baseline (legacy .savesync-baseline still read). */
   debug_report_sync_start_switch(cfg, local);
   std::vector<std::string> merge_ids;
   merge_ids.reserve(local_by_id.size() + remote.size());
@@ -1092,7 +1183,24 @@ static std::vector<std::string> run_sync(
     }
   }
 
-  if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .savesync-baseline");
+  if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .gbasync-baseline");
+  return logs;
+}
+
+static std::vector<std::string> run_dropbox_sync_once(const Config& cfg) {
+  std::vector<std::string> logs;
+  int status = 0;
+  std::vector<unsigned char> body;
+  std::vector<unsigned char> resp;
+  if (!http_request(cfg, "POST", "/dropbox/sync-once", body, status, resp, "application/json")) {
+    logs.push_back("Dropbox sync request: ERROR(request)");
+    return logs;
+  }
+  if (status == 200) {
+    logs.push_back("Dropbox sync request: OK");
+  } else {
+    logs.push_back("Dropbox sync request: HTTP " + std::to_string(status));
+  }
   return logs;
 }
 
@@ -1112,6 +1220,10 @@ static bool choose_action(PadState* pad, SyncAction* out_action) {
       *out_action = SyncAction::DownloadOnly;
       return true;
     }
+    if (down & HidNpadButton_Minus) {
+      *out_action = SyncAction::DropboxSync;
+      return true;
+    }
     if (down & HidNpadButton_Plus) {
       return false;
     }
@@ -1122,7 +1234,7 @@ static bool choose_action(PadState* pad, SyncAction* out_action) {
 
 static bool confirm_auto_sync(PadState* pad) {
   printf("\n--- Confirm (full sync) ---\n");
-  printf("Uses .savesync-baseline hashes (not SD mtimes).\n");
+  printf("Uses .gbasync-baseline hashes (legacy .savesync-baseline supported).\n");
   printf("Both-changed conflicts: X or Y on prompt. B skips.\n\n");
   printf("A: continue   B: back to main menu\n\n");
 
@@ -1187,7 +1299,8 @@ int main(int argc, char** argv) {
       printf("---------------------\n");
       printf("Server: %s\n", cfg.server_url.c_str());
       printf("Save dir: %s\n\n", cfg.save_dir.c_str());
-      printf("A: full sync   X: upload only   Y: download only\n\n");
+      printf("A: full sync   X: upload only   Y: download only\n");
+      printf("-: Dropbox sync now\n\n");
       printf("+ on this menu exits the app.\n\n");
 
       SyncAction action = SyncAction::Auto;
@@ -1198,7 +1311,9 @@ int main(int argc, char** argv) {
       SyncManualFilter xy{};
       xy.all = true;
       std::vector<std::string> sync_logs;
-      if (action == SyncAction::UploadOnly) {
+      if (action == SyncAction::DropboxSync) {
+        sync_logs = run_dropbox_sync_once(cfg);
+      } else if (action == SyncAction::UploadOnly) {
         if (!pick_upload_selection(&pad, cfg, &xy)) continue;
         sync_logs = run_sync(cfg, action, &xy, &pad);
       } else if (action == SyncAction::DownloadOnly) {

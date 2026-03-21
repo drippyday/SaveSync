@@ -1,12 +1,14 @@
 services:
-  savesync-server:
-    build: .
+  gbasync-server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
     ports:
       - "8080:8080"
     env_file:
-      - .env
-    # .env uses ./data/... for local uvicorn; in the container that resolves to /app/data and
-    # ignores this bind mount. Force /data paths so the host volume maps to real storage.
+      - ../.env
+    # Repo-root .env uses ../save_data/... when paths are interpreted from server/ cwd locally.
+    # In the container, force /data/... so the host volume (../save_data:/data) maps to real storage.
     environment:
       SAVE_ROOT: /data/saves
       HISTORY_ROOT: /data/history
@@ -14,4 +16,6 @@ services:
     volumes:
       # Repo root save_data/ (compose file lives in server/)
       - ../save_data:/data
+      # GBA ROMs on host → /roms in container (SAVESYNC_ROM_DIRS=/roms). Override path if needed.
+      - ${HOME}/Documents/GBA:/roms:ro
     restart: unless-stopped

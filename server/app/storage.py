@@ -29,13 +29,33 @@ class SaveStore:
         self.save_root.mkdir(parents=True, exist_ok=True)
         self.history_root.mkdir(parents=True, exist_ok=True)
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.index_path.exists():
+        self._ensure_valid_index_file()
+
+    def _ensure_valid_index_file(self) -> None:
+        """Create or repair index.json (empty/truncated/invalid files break JSON reads and uploads)."""
+        if not self.index_path.is_file():
+            self._write_index({})
+            return
+        try:
+            raw = self.index_path.read_text(encoding="utf-8")
+            if not raw.strip():
+                self._write_index({})
+                return
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                self._write_index({})
+        except (json.JSONDecodeError, OSError, UnicodeError):
             self._write_index({})
 
     def _read_index(self) -> dict[str, dict]:
-        with self.index_path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
+        try:
+            if not self.index_path.is_file() or self.index_path.stat().st_size == 0:
+                return {}
+            with self.index_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError, UnicodeError):
+            return {}
 
     def _write_index(self, data: dict[str, dict]) -> None:
         tmp = self.index_path.with_suffix(".tmp")
@@ -56,6 +76,10 @@ class SaveStore:
             index = self._read_index()
         out: list[SaveListItem] = []
         for game_id, raw in index.items():
+            # Index rows can outlive the blob (manual delete, restore mishap). Omit from /saves so
+            # clients do not try GET /save/{id} and hit 404 during auto sync.
+            if not self.save_path(game_id).is_file():
+                continue
             out.append(SaveListItem(game_id=game_id, **raw))
         out.sort(key=lambda item: item.game_id)
         return out

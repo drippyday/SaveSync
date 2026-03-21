@@ -1,1 +1,1 @@
-"""SaveSync server package."""
+"""GBAsync server package."""

@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SWITCH_DIR="$ROOT_DIR/switch-client"
 DIST_DIR="$ROOT_DIR/dist/switch"
 VERSION="${1:-dev}"
-OUT_DIR="$DIST_DIR/savesync-switch-${VERSION}"
+OUT_DIR="$DIST_DIR/gbasync-switch-${VERSION}"
 
 if [[ -z "${DEVKITPRO:-}" ]]; then
   if [[ -d "/opt/devkitpro" ]]; then
@@ -17,6 +17,7 @@ if [[ -z "${DEVKITPRO:-}" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR/gba-sync"
 
 make -C "$SWITCH_DIR" clean
 make -C "$SWITCH_DIR"
@@ -28,8 +29,8 @@ for artifact in "$SWITCH_DIR"/*.nro "$SWITCH_DIR"/*.nacp "$SWITCH_DIR"/*.elf; do
 done
 
 cat > "$OUT_DIR/INSTALL.txt" <<EOF
-SaveSync Switch Client - Install Guide
-======================================
+GBAsync Switch Client - Install Guide
+=====================================
 
 Artifact:
 - gbasync.nro
@@ -38,19 +39,19 @@ Artifact:
 
 Copy to SD:
 - gbasync.nro -> sdmc:/switch/gbasync.nro
-- create sdmc:/switch/gba-sync/config.ini
+- copy gba-sync/config.ini -> sdmc:/switch/gba-sync/config.ini
 
 config.ini example:
 
 [server]
-url=http://192.168.1.50:8080
+url=http://10.0.0.151:8080
 api_key=change-me
 
 [sync]
-save_dir=sdmc:/roms/gba/saves
+save_dir=sdmc:/mGBA
 
 [rom]
-rom_dir=sdmc:/roms/gba
+rom_dir=sdmc:/mGBA
 rom_extension=.gba
 
 Run:
@@ -59,7 +60,8 @@ Run:
 3) A = full sync (per-game newer local mtime vs server; may upload some, download others)
 4) X = upload-only: confirm, then checkboxes (ALL SAVES or each game), + = OK, B = cancel
 5) Y = download-only: same pick list, then downloads selected games
-6) Press + to exit
+6) - = trigger Dropbox sync-once on server
+7) Press + to exit
 
 Expected status example:
 - Local saves: 3
@@ -76,6 +78,19 @@ What each artifact is:
 - gbasync.nro: app you run from Homebrew Menu
 - gbasync.nacp: metadata file (title/author/version)
 - gbasync.elf: raw executable/debug artifact (not usually copied to SD)
+EOF
+
+cat > "$OUT_DIR/gba-sync/config.ini" <<EOF
+[server]
+url=http://10.0.0.151:8080
+api_key=change-me
+
+[sync]
+save_dir=sdmc:/mGBA
+
+[rom]
+rom_dir=sdmc:/mGBA
+rom_extension=.gba
 EOF
 
 echo "Switch release artifacts created in: $OUT_DIR"

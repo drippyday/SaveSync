@@ -11,7 +11,7 @@ Nintendo 3DS homebrew sync client using socket-based HTTP with libctru networkin
    - `GET /saves`
    - `GET /save/{game_id}` (+ `/meta`)
    - `PUT /save/{game_id}` (`force=1` on uploads from this client)
-5. **Auto (A):** **`.savesync-baseline`** + SHA-256 policy; first-run **SKIP** until X/Y seeds baseline; **Conflict** UI (X/Y/B)
+5. **Auto (A):** **`.gbasync-baseline`** + SHA-256 policy (legacy **`.savesync-baseline`** still supported); first-run **SKIP** until X/Y seeds baseline; **Conflict** UI (X/Y/B)
 6. **Upload** / **download** pickers; **START** / **R** / **X** or **Y** to run batch, **B** back
 7. **Full-sync confirm** (A / B / START per on-screen copy)
 8. **Post-sync:** **A** main menu, **START** exit app (skips second exit prompt)
@@ -21,12 +21,12 @@ Nintendo 3DS homebrew sync client using socket-based HTTP with libctru networkin
 
 ```ini
 [server]
-url=http://192.168.1.50:8080
+url=http://10.0.0.151:8080
 api_key=change-me
 
 [sync]
 mode=normal
-save_dir=sdmc:/saves
+save_dir=sdmc:/mGBA
 vc_save_dir=sdmc:/3ds/Checkpoint/saves
 
 [rom]

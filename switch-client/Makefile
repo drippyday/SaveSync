@@ -17,9 +17,10 @@ LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) \
 	-Wl,-Map,$(TARGET).map
 LIBS := -lnx
 
-APP_TITLE := SaveSync
-APP_AUTHOR := alexkirst
-APP_VERSION := 0.1.2
+APP_TITLE := GBAsync
+APP_AUTHOR := drippyday
+APP_VERSION := 0.1.3
+ICON_SRC := ../icons/switch_icon_256x256-2.jpg
 
 OBJ := $(BUILD)/main.o
 
@@ -40,7 +41,13 @@ $(TARGET).nacp:
 	$(TOOLS)/nacptool --create "$(APP_TITLE)" "$(APP_AUTHOR)" "$(APP_VERSION)" $@
 
 $(TARGET).nro: $(TARGET).elf $(TARGET).nacp
-	$(TOOLS)/elf2nro $(TARGET).elf $@ --nacp=$(TARGET).nacp --icon=$(DEVKITPRO)/libnx/default_icon.jpg
+	@if [ -f "$(ICON_SRC)" ]; then \
+		ICON="$(ICON_SRC)"; \
+	else \
+		echo "WARN: custom icon not found; using default libnx icon"; \
+		ICON="$(DEVKITPRO)/libnx/default_icon.jpg"; \
+	fi; \
+	$(TOOLS)/elf2nro $(TARGET).elf $@ --nacp=$(TARGET).nacp --icon="$$ICON"
 
 clean:
 	rm -rf $(BUILD) $(TARGET).elf $(TARGET).nro $(TARGET).nacp $(TARGET).map

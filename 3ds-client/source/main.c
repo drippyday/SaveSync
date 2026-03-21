@@ -47,6 +47,11 @@ typedef struct {
   char sha256[65];
 } BaselineRow;
 
+typedef struct {
+  char save_stem[256];
+  char game_id[128];
+} IdMapRow;
+
 #define MAX_SAVES 256
 #define SOC_BUFFERSIZE (0x100000)
 
@@ -54,7 +59,13 @@ typedef enum {
   SYNC_ACTION_AUTO = 0,
   SYNC_ACTION_UPLOAD_ONLY = 1,
   SYNC_ACTION_DOWNLOAD_ONLY = 2,
+  SYNC_ACTION_DROPBOX_SYNC = 3,
 } SyncAction;
+
+typedef struct {
+  int uploads;
+  int downloads;
+} SyncSummary;
 
 typedef struct {
   int all;
@@ -63,6 +74,7 @@ typedef struct {
 } SyncManualFilter;
 
 static void ensure_directory_exists(const char* dir);
+static void wait_after_sync_3ds(bool* quit_app, bool can_reboot);
 
 static void manual_filter_free(SyncManualFilter* f) {
   if (!f) return;
@@ -108,9 +120,12 @@ static void copy_cstr(char* dst, size_t dst_size, const char* src) {
 
 static void config_init(AppConfig* cfg) {
   memset(cfg, 0, sizeof(*cfg));
-  copy_cstr(cfg->save_dir, sizeof(cfg->save_dir), "sdmc:/saves");
+  copy_cstr(cfg->server_url, sizeof(cfg->server_url), "http://10.0.0.151:8080");
+  copy_cstr(cfg->api_key, sizeof(cfg->api_key), "change-me");
+  copy_cstr(cfg->save_dir, sizeof(cfg->save_dir), "sdmc:/3ds/open_agb_firm/saves/");
   copy_cstr(cfg->sync_mode, sizeof(cfg->sync_mode), "normal");
   copy_cstr(cfg->vc_save_dir, sizeof(cfg->vc_save_dir), "sdmc:/3ds/Checkpoint/saves");
+  copy_cstr(cfg->rom_dir, sizeof(cfg->rom_dir), "sdmc:/roms/gba");
   copy_cstr(cfg->rom_extension, sizeof(cfg->rom_extension), ".gba");
 }
 
@@ -162,6 +177,13 @@ static void load_config(AppConfig* cfg, const char* path) {
       copy_cstr(cfg->vc_save_dir, sizeof(cfg->vc_save_dir), value);
     } else if (strcmp(section, "rom") == 0 && strcmp(key, "rom_dir") == 0) {
       copy_cstr(cfg->rom_dir, sizeof(cfg->rom_dir), value);
+      /* Avoid sdmc:/foo/ + /stem.gba -> double slash (some paths fail to open). */
+      {
+        size_t n = strlen(cfg->rom_dir);
+        while (n > 0 && (cfg->rom_dir[n - 1] == '/' || cfg->rom_dir[n - 1] == '\\')) {
+          cfg->rom_dir[--n] = '\0';
+        }
+      }
     } else if (strcmp(section, "rom") == 0 && strcmp(key, "rom_extension") == 0) {
       copy_cstr(cfg->rom_extension, sizeof(cfg->rom_extension), value);
     }
@@ -301,7 +323,7 @@ static bool write_atomic_file(const char* path, const unsigned char* data, size_
   char tmp_path[600];
   unsigned long long tick = osGetTime();
   if (slash && parent_dir[0] != '\0') {
-    snprintf(tmp_path, sizeof(tmp_path), "%s/.savesync-%llu.tmp", parent_dir, tick);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/.gbasync-%llu.tmp", parent_dir, tick);
   } else {
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
   }
@@ -387,13 +409,11 @@ static void ensure_directory_exists(const char* dir) {
   (void)mkdir(dir, 0777);
 }
 
-static void baseline_file_path(char* out, size_t out_sz, const char* save_dir) {
-  join_path(out, out_sz, save_dir, ".savesync-baseline");
+static void baseline_file_path(char* out, size_t out_sz, const char* save_dir, const char* filename) {
+  join_path(out, out_sz, save_dir, filename);
 }
 
-static int baseline_load(const char* save_dir, BaselineRow* rows, int max_rows) {
-  char path[512];
-  baseline_file_path(path, sizeof(path), save_dir);
+static int baseline_load_from_path(const char* path, BaselineRow* rows, int max_rows) {
   FILE* fp = fopen(path, "r");
   if (!fp) return 0;
   int n = 0;
@@ -416,9 +436,18 @@ static int baseline_load(const char* save_dir, BaselineRow* rows, int max_rows) 
   return n;
 }
 
-static bool baseline_save(const char* save_dir, BaselineRow* rows, int n) {
-  char path[512], tmp[520];
-  baseline_file_path(path, sizeof(path), save_dir);
+static int baseline_load(const char* save_dir, BaselineRow* rows, int max_rows) {
+  char new_path[512];
+  baseline_file_path(new_path, sizeof(new_path), save_dir, ".gbasync-baseline");
+  int n = baseline_load_from_path(new_path, rows, max_rows);
+  if (n > 0) return n;
+  char old_path[512];
+  baseline_file_path(old_path, sizeof(old_path), save_dir, ".savesync-baseline");
+  return baseline_load_from_path(old_path, rows, max_rows);
+}
+
+static bool baseline_save_to_path(const char* path, BaselineRow* rows, int n) {
+  char tmp[520];
   if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) return false;
   FILE* fp = fopen(tmp, "w");
   if (!fp) return false;
@@ -431,6 +460,84 @@ static bool baseline_save(const char* save_dir, BaselineRow* rows, int n) {
     remove(tmp);
     return false;
   }
+  return true;
+}
+
+static bool baseline_save(const char* save_dir, BaselineRow* rows, int n) {
+  char new_path[512];
+  baseline_file_path(new_path, sizeof(new_path), save_dir, ".gbasync-baseline");
+  bool ok = baseline_save_to_path(new_path, rows, n);
+  if (!ok) return false;
+  // Write legacy filename too so older client builds stay compatible during migration.
+  char old_path[512];
+  baseline_file_path(old_path, sizeof(old_path), save_dir, ".savesync-baseline");
+  (void)baseline_save_to_path(old_path, rows, n);
+  return true;
+}
+
+static void id_map_file_path(char* out, size_t out_sz, const char* save_dir) {
+  join_path(out, out_sz, save_dir, ".gbasync-idmap");
+}
+
+static int id_map_find(IdMapRow* rows, int n, const char* stem) {
+  for (int i = 0; i < n; i++) {
+    if (strcmp(rows[i].save_stem, stem) == 0) return i;
+  }
+  return -1;
+}
+
+static int id_map_load(const char* save_dir, IdMapRow* rows, int max_rows) {
+  char path[512];
+  id_map_file_path(path, sizeof(path), save_dir);
+  FILE* fp = fopen(path, "r");
+  if (!fp) return 0;
+  int n = 0;
+  char line[520];
+  while (n < max_rows && fgets(line, sizeof(line), fp)) {
+    char* tab = strchr(line, '\t');
+    if (!tab) continue;
+    *tab = '\0';
+    char* gid = tab + 1;
+    trim_line(line);
+    trim_line(gid);
+    if (line[0] == '\0' || gid[0] == '\0') continue;
+    copy_cstr(rows[n].save_stem, sizeof(rows[n].save_stem), line);
+    copy_cstr(rows[n].game_id, sizeof(rows[n].game_id), gid);
+    n++;
+  }
+  fclose(fp);
+  return n;
+}
+
+static bool id_map_save(const char* save_dir, IdMapRow* rows, int n) {
+  char path[512], tmp[520];
+  id_map_file_path(path, sizeof(path), save_dir);
+  if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) return false;
+  FILE* fp = fopen(tmp, "w");
+  if (!fp) return false;
+  for (int i = 0; i < n; i++) {
+    fprintf(fp, "%s\t%s\n", rows[i].save_stem, rows[i].game_id);
+  }
+  fclose(fp);
+  remove(path);
+  if (rename(tmp, path) != 0) {
+    remove(tmp);
+    return false;
+  }
+  return true;
+}
+
+static bool id_map_upsert(IdMapRow* rows, int* n, int max_rows, const char* stem, const char* gid) {
+  int idx = id_map_find(rows, *n, stem);
+  if (idx >= 0) {
+    if (strcmp(rows[idx].game_id, gid) == 0) return false;
+    copy_cstr(rows[idx].game_id, sizeof(rows[idx].game_id), gid);
+    return true;
+  }
+  if (*n >= max_rows) return false;
+  copy_cstr(rows[*n].save_stem, sizeof(rows[*n].save_stem), stem);
+  copy_cstr(rows[*n].game_id, sizeof(rows[*n].game_id), gid);
+  (*n)++;
   return true;
 }
 
@@ -951,33 +1058,65 @@ static bool local_game_id_exists(LocalSave* local, int local_count, const char* 
   return false;
 }
 
+static int cmp_name_rows(const void* a, const void* b) {
+  return strcmp((const char*)a, (const char*)b);
+}
+
 static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* out, int max_items) {
   DIR* d = opendir(dir);
   if (!d) {
     printf("ERROR: cannot open save_dir: %s (errno=%d)\n", dir, errno);
     return 0;
   }
+  IdMapRow* id_map = (IdMapRow*)calloc(1024, sizeof(IdMapRow));
+  if (!id_map) {
+    closedir(d);
+    printf("ERROR: out of memory (id map)\n");
+    return 0;
+  }
+  int n_id_map = id_map_load(dir, id_map, 1024);
+  bool id_map_changed = false;
+  char(*sav_names)[256] = (char(*)[256])calloc((size_t)MAX_SAVES, sizeof(*sav_names));
+  if (!sav_names) {
+    free(id_map);
+    closedir(d);
+    printf("ERROR: out of memory (save list)\n");
+    return 0;
+  }
+  int n_sav_names = 0;
   int count = 0;
   int sav_candidates = 0;
   int read_failures = 0;
   int stat_failures = 0;
   struct dirent* ent;
-  while ((ent = readdir(d)) != NULL && count < max_items) {
+  while ((ent = readdir(d)) != NULL && n_sav_names < max_items && n_sav_names < MAX_SAVES) {
     if (!has_sav_extension(ent->d_name)) continue;
+    copy_cstr(sav_names[n_sav_names], sizeof(sav_names[n_sav_names]), ent->d_name);
+    n_sav_names++;
+  }
+  closedir(d);
+  qsort(sav_names, (size_t)n_sav_names, sizeof(sav_names[0]), cmp_name_rows);
+
+  for (int ni = 0; ni < n_sav_names && count < max_items; ni++) {
     sav_candidates++;
     LocalSave item;
     memset(&item, 0, sizeof(item));
-    snprintf(item.name, sizeof(item.name), "%s", ent->d_name);
+    copy_cstr(item.name, sizeof(item.name), sav_names[ni]);
     size_t dir_len = strlen(dir);
     bool has_trailing_slash = dir_len > 0 && dir[dir_len - 1] == '/';
-    snprintf(item.path, sizeof(item.path), "%s%s%s", dir, has_trailing_slash ? "" : "/", ent->d_name);
+    snprintf(item.path, sizeof(item.path), "%s%s%s", dir, has_trailing_slash ? "" : "/", item.name);
     char stem[256];
-    snprintf(stem, sizeof(stem), "%s", ent->d_name);
+    copy_cstr(stem, sizeof(stem), item.name);
     char* dot = strrchr(stem, '.');
     if (dot) *dot = '\0';
-    resolve_game_id_for_save(cfg, stem, item.game_id, sizeof(item.game_id));
+    int map_idx = id_map_find(id_map, n_id_map, stem);
+    if (map_idx >= 0 && id_map[map_idx].game_id[0] != '\0') {
+      copy_cstr(item.game_id, sizeof(item.game_id), id_map[map_idx].game_id);
+    } else {
+      resolve_game_id_for_save(cfg, stem, item.game_id, sizeof(item.game_id));
+    }
     if (local_game_id_exists(out, count, item.game_id)) {
-      // Avoid local collisions when multiple ROMs share the same header ID.
+      // Ensure unique IDs per local save even when ROM headers collide.
       char base_id[128];
       sanitize_game_id(stem, base_id, sizeof(base_id));
       if (base_id[0] == '\0') copy_cstr(base_id, sizeof(base_id), "unknown-game");
@@ -988,6 +1127,9 @@ static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* ou
       while (local_game_id_exists(out, count, item.game_id) && suffix < 1000) {
         snprintf(item.game_id, sizeof(item.game_id), "%s-%d", base_short, suffix++);
       }
+    }
+    if (id_map_upsert(id_map, &n_id_map, 1024, stem, item.game_id)) {
+      id_map_changed = true;
     }
 
     struct stat st;
@@ -1010,7 +1152,11 @@ static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* ou
 
     out[count++] = item;
   }
-  closedir(d);
+  if (id_map_changed) {
+    (void)id_map_save(dir, id_map, n_id_map);
+  }
+  free(sav_names);
+  free(id_map);
   if (sav_candidates == 0) {
     printf("No .sav files found in %s\n", dir);
   } else if (count == 0) {
@@ -1190,7 +1336,8 @@ static void resolve_both_changed_conflict(
     RemoteSave* r,
     const char* id,
     BaselineRow* baseline,
-    int* n_baseline) {
+    int* n_baseline,
+    SyncSummary* summary) {
   consoleClear();
   printf("\n");
   printf("  -------- Conflict --------\n");
@@ -1208,12 +1355,14 @@ static void resolve_both_changed_conflict(
     if (kDown & KEY_X) {
       if (put_one_save(cfg, l, true, source_tag)) {
         baseline_upsert(baseline, n_baseline, MAX_SAVES, id, l->sha256);
+        if (summary) summary->uploads++;
       }
       break;
     }
     if (kDown & KEY_Y) {
       if (get_one_save(cfg, save_dir, id, r)) {
         baseline_upsert(baseline, n_baseline, MAX_SAVES, id, r->sha256);
+        if (summary) summary->downloads++;
       }
       break;
     }
@@ -1467,7 +1616,8 @@ static bool pick_download_selection_3ds(const AppConfig* cfg, SyncManualFilter* 
   return false;
 }
 
-static void run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFilter* xy_filter) {
+static SyncSummary run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFilter* xy_filter) {
+  SyncSummary summary = {0};
   printf("Scanning local saves...\n");
   LocalSave* local = (LocalSave*)calloc(MAX_SAVES, sizeof(LocalSave));
   RemoteSave* remote = (RemoteSave*)calloc(MAX_SAVES, sizeof(RemoteSave));
@@ -1475,7 +1625,7 @@ static void run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFi
     printf("ERROR: out of memory for sync buffers\n");
     free(local);
     free(remote);
-    return;
+    return summary;
   }
   const char* save_dir = active_save_dir(cfg);
   const char* source_tag = is_vc_mode(cfg) ? "3ds-homebrew-vc" : "3ds-homebrew";
@@ -1485,7 +1635,7 @@ static void run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFi
     printf("ERROR: out of memory (baseline buffer)\n");
     free(local);
     free(remote);
-    return;
+    return summary;
   }
   int n_baseline = baseline_load(save_dir, baseline, MAX_SAVES);
   int local_count = scan_local_saves(cfg, save_dir, local, MAX_SAVES);
@@ -1500,7 +1650,7 @@ static void run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFi
     free(baseline);
     free(local);
     free(remote);
-    return;
+    return summary;
   }
   int remote_count = parse_remote_saves((const char*)body, remote, MAX_SAVES);
   free(body);
@@ -1511,15 +1661,16 @@ static void run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFi
       if (!id_in_manual(xy_filter, local[i].game_id)) continue;
       if (put_one_save(cfg, &local[i], true, source_tag)) {
         baseline_upsert(baseline, &n_baseline, MAX_SAVES, local[i].game_id, local[i].sha256);
+        summary.uploads++;
       }
     }
     if (!baseline_save(save_dir, baseline, n_baseline)) {
-      printf("WARN: could not write .savesync-baseline\n");
+      printf("WARN: could not write .gbasync-baseline\n");
     }
     free(baseline);
     free(local);
     free(remote);
-    return;
+    return summary;
   }
 
   if (action == SYNC_ACTION_DOWNLOAD_ONLY) {
@@ -1527,15 +1678,16 @@ static void run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFi
       if (!id_in_manual(xy_filter, remote[i].game_id)) continue;
       if (get_one_save(cfg, save_dir, remote[i].game_id, &remote[i])) {
         baseline_upsert(baseline, &n_baseline, MAX_SAVES, remote[i].game_id, remote[i].sha256);
+        summary.downloads++;
       }
     }
     if (!baseline_save(save_dir, baseline, n_baseline)) {
-      printf("WARN: could not write .savesync-baseline\n");
+      printf("WARN: could not write .gbasync-baseline\n");
     }
     free(baseline);
     free(local);
     free(remote);
-    return;
+    return summary;
   }
 
   /* AUTO — merge id list on heap (large stack arrays overflow 3DS default stack) */
@@ -1546,7 +1698,7 @@ static void run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFi
     free(baseline);
     free(local);
     free(remote);
-    return;
+    return summary;
   }
   int n_merge = 0;
   for (int i = 0; i < local_count; i++) {
@@ -1581,33 +1733,38 @@ static void run_sync(const AppConfig* cfg, SyncAction action, const SyncManualFi
       if (loc_eq && !rem_eq) {
         if (get_one_save(cfg, save_dir, id, r)) {
           baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, r->sha256);
+          summary.downloads++;
         }
       } else if (!loc_eq && rem_eq) {
         if (put_one_save(cfg, l, false, source_tag)) {
           baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, l->sha256);
+          summary.uploads++;
         }
       } else if (!loc_eq && !rem_eq) {
-        resolve_both_changed_conflict(cfg, save_dir, source_tag, l, r, id, baseline, &n_baseline);
+        resolve_both_changed_conflict(cfg, save_dir, source_tag, l, r, id, baseline, &n_baseline, &summary);
       }
     } else if (l && !r) {
       if (put_one_save(cfg, l, false, source_tag)) {
         baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, l->sha256);
+        summary.uploads++;
       }
     } else if (!l && r) {
       if (get_one_save(cfg, save_dir, id, r)) {
         baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, r->sha256);
+        summary.downloads++;
       }
     }
   }
 
   if (!baseline_save(save_dir, baseline, n_baseline)) {
-    printf("WARN: could not write .savesync-baseline\n");
+    printf("WARN: could not write .gbasync-baseline\n");
   }
 
   free(merge_ids);
   free(baseline);
   free(local);
   free(remote);
+  return summary;
 }
 
 static bool choose_action(SyncAction* out_action) {
@@ -1626,6 +1783,10 @@ static bool choose_action(SyncAction* out_action) {
       *out_action = SYNC_ACTION_DOWNLOAD_ONLY;
       return true;
     }
+    if (kDown & KEY_SELECT) {
+      *out_action = SYNC_ACTION_DROPBOX_SYNC;
+      return true;
+    }
     if (kDown & KEY_START) {
       return false;
     }
@@ -1634,6 +1795,23 @@ static bool choose_action(SyncAction* out_action) {
     gspWaitForVBlank();
   }
   return false;
+}
+
+static void run_dropbox_sync_once_3ds(const AppConfig* cfg, bool* quit_app) {
+  printf("\nDropbox sync now...\n");
+  int st = 0;
+  unsigned char* resp = NULL;
+  size_t resp_len = 0;
+  bool ok = http_request(cfg, "POST", "/dropbox/sync-once", "application/json", NULL, 0, &st, &resp, &resp_len);
+  if (!ok) {
+    printf("Dropbox sync request: ERROR(request)\n");
+  } else if (st == 200) {
+    printf("Dropbox sync request: OK\n");
+  } else {
+    printf("Dropbox sync request: HTTP %d\n", st);
+  }
+  free(resp);
+  wait_after_sync_3ds(quit_app, false);
 }
 
 static bool confirm_auto_sync(void) {
@@ -1662,12 +1840,24 @@ static bool confirm_auto_sync(void) {
   return false;
 }
 
-static void wait_after_sync_3ds(bool* quit_app) {
-  printf("\na: main menu   START: exit app\n");
+static void wait_after_sync_3ds(bool* quit_app, bool can_reboot) {
+  if (can_reboot) {
+    printf("\na: main menu   y: reboot now   START: exit app\n");
+  } else {
+    printf("\na: main menu   START: exit app\n");
+  }
   while (aptMainLoop()) {
     hidScanInput();
     u32 kDown = hidKeysDown();
     if (kDown & KEY_A) return;
+    if (can_reboot && (kDown & KEY_Y)) {
+      printf("Rebooting...\n");
+      (void)gfxFlushBuffers();
+      (void)gfxSwapBuffers();
+      (void)APT_HardwareResetAsync();
+      *quit_app = true;
+      return;
+    }
     if (kDown & KEY_START) {
       *quit_app = true;
       return;
@@ -1717,6 +1907,7 @@ int main(int argc, char** argv) {
       printf("a: Full sync\n");
       printf("x: Upload only\n");
       printf("y: Download only\n\n");
+      printf("SELECT: Dropbox sync now\n\n");
       printf("START on this menu exits the app.\n");
 
       SyncAction action = SYNC_ACTION_AUTO;
@@ -1730,23 +1921,27 @@ int main(int argc, char** argv) {
         continue;
       }
 
-      if (action == SYNC_ACTION_UPLOAD_ONLY) {
+      if (action == SYNC_ACTION_DROPBOX_SYNC) {
+        run_dropbox_sync_once_3ds(&cfg, &quit_app);
+      } else if (action == SYNC_ACTION_UPLOAD_ONLY) {
         if (!pick_upload_selection_3ds(&cfg, &xy)) {
           manual_filter_free(&xy);
           continue;
         }
-        run_sync(&cfg, action, &xy);
+        SyncSummary summary = run_sync(&cfg, action, &xy);
+        wait_after_sync_3ds(&quit_app, summary.downloads > 0);
       } else if (action == SYNC_ACTION_DOWNLOAD_ONLY) {
         if (!pick_download_selection_3ds(&cfg, &xy)) {
           manual_filter_free(&xy);
           continue;
         }
-        run_sync(&cfg, action, &xy);
+        SyncSummary summary = run_sync(&cfg, action, &xy);
+        wait_after_sync_3ds(&quit_app, summary.downloads > 0);
       } else {
-        run_sync(&cfg, action, NULL);
+        SyncSummary summary = run_sync(&cfg, action, NULL);
+        wait_after_sync_3ds(&quit_app, summary.downloads > 0);
       }
       manual_filter_free(&xy);
-      wait_after_sync_3ds(&quit_app);
     }
   }
   if (!quit_app) {

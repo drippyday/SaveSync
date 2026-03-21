@@ -1,0 +1,16 @@
+{
+  "server_url": "http://127.0.0.1:8080",
+  "api_key": "change-me",
+  "sync_mode": "server_delta",
+  "local_save_dir": "/path/to/save_data/saves",
+  "backup_dir": "./delta-api-backups",
+  "delta_slot_map_path": "/path/to/save_data/delta-slot-map.json",
+  "dropbox": {
+    "remote_delta_folder": "/Delta Emulator"
+  },
+  "rom_dirs": [
+    "/path/to/ROMs/GBA"
+  ],
+  "rom_map_path": "/path/to/rom-map.json",
+  "rom_extensions": [".gba"]
+}

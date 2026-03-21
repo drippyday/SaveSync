@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -98,3 +99,31 @@ def test_delete_save(tmp_path: Path) -> None:
 
     missing = client.delete("/save/stale-test", headers=_auth_headers())
     assert missing.status_code == 404
+
+
+def test_save_store_repairs_empty_index_file(tmp_path: Path) -> None:
+    index_path = tmp_path / "index.json"
+    index_path.write_text("", encoding="utf-8")
+    SaveStore(save_root=tmp_path / "saves", history_root=tmp_path / "history", index_path=index_path)
+    assert json.loads(index_path.read_text(encoding="utf-8")) == {}
+
+
+def test_list_saves_omits_index_without_blob(tmp_path: Path) -> None:
+    """Orphan index rows must not appear in /saves (avoids client ERROR(download) on GET)."""
+    client = _make_client(tmp_path)
+    index_path = tmp_path / "index.json"
+    ghost = {
+        "ghost": {
+            "last_modified_utc": "2026-01-01T00:00:00+00:00",
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "size_bytes": 0,
+            "filename_hint": None,
+            "platform_source": None,
+            "conflict": False,
+            "version": 1,
+        }
+    }
+    index_path.write_text(json.dumps(ghost), encoding="utf-8")
+    listed = client.get("/saves", headers=_auth_headers())
+    assert listed.status_code == 200
+    assert listed.json()["saves"] == []

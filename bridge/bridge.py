@@ -185,7 +185,7 @@ class SaveEventHandler(FileSystemEventHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Delta <-> SaveSync bridge")
+    parser = argparse.ArgumentParser(description="Delta <-> GBAsync bridge")
     parser.add_argument("--config", required=True, help="Path to bridge JSON config")
     parser.add_argument("--watch", action="store_true", help="Run continuous sync loop")
     parser.add_argument("--once", action="store_true", help="Run one sync pass then exit")

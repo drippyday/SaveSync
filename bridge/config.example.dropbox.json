@@ -1,0 +1,13 @@
+{
+  "server_url": "http://127.0.0.1:8080",
+  "api_key": "change-me",
+  "poll_seconds": 60,
+  "dropbox": {
+    "remote_folder": "/GBAsync/gba"
+  },
+  "rom_dirs": [
+    "/Users/your-user/ROMs/GBA"
+  ],
+  "rom_map_path": "/Users/your-user/.config/savesync/rom-map.json",
+  "rom_extensions": [".gba"]
+}

@@ -1,0 +1,18 @@
+BasicInfo:
+  Title                   : "GBAsync"
+  CompanyCode             : "00"
+  ProductCode             : "CTR-H-SYNC"
+  ContentType             : Application
+  Logo                    : Nintendo
+
+TitleInfo:
+  UniqueId                : 0x5A5E0
+  Category                : Application
+  Version                 : 0x2D7A
+
+Option:
+  EnableCrypt             : False
+  FreeProductCode         : True
+  MediaFootPadding        : False
+  UseOnSD                 : True
+  EnableCompress          : True

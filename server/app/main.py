@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,7 +16,9 @@ from .auth import require_api_key
 from .models import SaveListResponse, SaveMeta
 from .storage import SaveStore
 
-load_dotenv()
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_BRIDGE_DIR = _REPO_ROOT / "bridge"
+load_dotenv(_REPO_ROOT / ".env")
 
 SAVE_ROOT = Path(os.getenv("SAVE_ROOT", "./data/saves")).resolve()
 HISTORY_ROOT = Path(os.getenv("HISTORY_ROOT", "./data/history")).resolve()
@@ -27,13 +32,126 @@ store = SaveStore(
     keep_history=ENABLE_VERSION_HISTORY,
 )
 
-app = FastAPI(title="SaveSync Server", version="0.1.2")
+app = FastAPI(title="GBAsync Server", version="0.1.2")
 
-_log = logging.getLogger("savesync")
+_log = logging.getLogger("gbasync")
+_dropbox_sync_timer_lock = threading.Lock()
+_dropbox_sync_timer: threading.Timer | None = None
+_dropbox_sync_run_lock = threading.Lock()
+
+
+def _env(name: str, default: str = "") -> str:
+    if name.startswith("GBASYNC_"):
+        legacy = "SAVESYNC_" + name[len("GBASYNC_") :]
+        v = os.getenv(name, "").strip()
+        if v:
+            return v
+        return os.getenv(legacy, default).strip()
+    return os.getenv(name, default).strip()
 
 
 def _client_debug_logging_enabled() -> bool:
     return os.getenv("SAVE_SYNC_LOG_CLIENT_DEBUG", "").lower() in ("1", "true", "yes")
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _dropbox_sync_on_upload_enabled() -> bool:
+    return _env_truthy("GBASYNC_DROPBOX_SYNC_ON_UPLOAD") or _env_truthy("SAVESYNC_DROPBOX_SYNC_ON_UPLOAD")
+
+
+def _dropbox_sync_debounce_seconds() -> float:
+    raw = _env("GBASYNC_DROPBOX_SYNC_DEBOUNCE_SECONDS", "10")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        _log.warning("invalid GBASYNC_DROPBOX_SYNC_DEBOUNCE_SECONDS=%r, using 10s", raw)
+        return 10.0
+
+
+def _bridge_runtime_paths() -> tuple[Path, Path] | None:
+    """(bridge_dir, cwd) for subprocess; None if bridge scripts not on this machine."""
+    if Path("/app/bridge/delta_dropbox_api_sync.py").is_file():
+        return Path("/app/bridge"), Path("/app")
+    if (_BRIDGE_DIR / "delta_dropbox_api_sync.py").is_file():
+        return _BRIDGE_DIR, _REPO_ROOT
+    return None
+
+
+def _run_dropbox_bridge_once() -> None:
+    mode = _env("GBASYNC_DROPBOX_MODE", "off").lower()
+    if mode == "delta_api":
+        cfg_name = "/tmp/gbasync-delta-api.json"
+        script_name = "delta_dropbox_api_sync.py"
+    elif mode == "plain":
+        cfg_name = "/tmp/gbasync-plain-bridge.json"
+        script_name = "dropbox_bridge.py"
+    else:
+        return
+
+    cfg_path = Path(cfg_name)
+    if not cfg_path.is_file():
+        _log.warning("dropbox sync skipped: %s not found (is Dropbox mode enabled in this container?)", cfg_name)
+        return
+
+    paths = _bridge_runtime_paths()
+    if not paths:
+        _log.warning("dropbox sync skipped: bridge scripts not found")
+        return
+    bridge_dir, cwd = paths
+    script_path = bridge_dir / script_name
+    if not script_path.is_file():
+        _log.warning("dropbox sync skipped: %s missing", script_path)
+        return
+
+    env = os.environ.copy()
+    prev = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{bridge_dir}{os.pathsep}{prev}" if prev else str(bridge_dir)
+
+    timeout = int(_env("GBASYNC_DROPBOX_SYNC_TIMEOUT_SECONDS", "600"))
+    try:
+        r = subprocess.run(
+            [sys.executable, str(script_path), "--config", str(cfg_path), "--once"],
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if r.returncode != 0:
+            tail = (r.stderr or r.stdout or "").strip()[-2000:]
+            _log.warning("dropbox sync exit %s: %s", r.returncode, tail or "(no output)")
+    except subprocess.TimeoutExpired:
+        _log.warning("dropbox sync timed out after %ss", timeout)
+    except OSError as exc:
+        _log.warning("dropbox sync failed: %s", exc)
+
+
+def _dropbox_sync_after_upload_runner() -> None:
+    if not _dropbox_sync_run_lock.acquire(blocking=False):
+        # A sync run is already active; try again after another quiet window.
+        _log.info("dropbox sync already running; rescheduling upload-triggered sync")
+        _schedule_dropbox_sync_after_upload()
+        return
+    try:
+        _run_dropbox_bridge_once()
+    finally:
+        _dropbox_sync_run_lock.release()
+
+
+def _schedule_dropbox_sync_after_upload() -> None:
+    delay = _dropbox_sync_debounce_seconds()
+    with _dropbox_sync_timer_lock:
+        global _dropbox_sync_timer
+        if _dropbox_sync_timer is not None:
+            _dropbox_sync_timer.cancel()
+            _dropbox_sync_timer = None
+        t = threading.Timer(delay, _dropbox_sync_after_upload_runner)
+        t.daemon = True
+        _dropbox_sync_timer = t
+        t.start()
 
 
 class ClientDebugReport(BaseModel):
@@ -121,7 +239,7 @@ def put_save(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    return JSONResponse(
+    resp = JSONResponse(
         status_code=200,
         content={
             "game_id": game_id,
@@ -131,6 +249,25 @@ def put_save(
             "effective_meta": effective.model_dump(),
         },
     )
+    if applied and _dropbox_sync_on_upload_enabled():
+        _schedule_dropbox_sync_after_upload()
+    return resp
+
+
+@app.post("/dropbox/sync-once", dependencies=[Depends(require_api_key)])
+def dropbox_sync_once() -> JSONResponse:
+    """
+    Run one Dropbox bridge pass (``delta_api`` or ``plain``) in-process, blocking until done.
+    Serialized with the sidecar via ``/tmp/gbasync-dropbox-sync.lock``.
+    """
+    mode = _env("GBASYNC_DROPBOX_MODE", "off").lower()
+    if mode not in ("delta_api", "plain"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GBASYNC_DROPBOX_MODE must be delta_api or plain",
+        )
+    _run_dropbox_bridge_once()
+    return JSONResponse(status_code=200, content={"ok": True, "mode": mode})
 
 
 @app.post("/resolve/{game_id}", dependencies=[Depends(require_api_key)])

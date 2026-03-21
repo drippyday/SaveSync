@@ -1,4 +1,4 @@
-# SaveSync Server
+# GBAsync Server
 
 FastAPI backend for binary save storage and metadata coordination.
 
@@ -27,11 +27,15 @@ FastAPI backend for binary save storage and metadata coordination.
 
 ## Run
 
+**Docker (from `server/`, repo-root `.env`):** see root `USER_GUIDE.md`. The image entrypoint runs **uvicorn** and optionally a Dropbox **sidecar** when `SAVESYNC_DROPBOX_MODE` is not `off`.
+
+**Local uvicorn:**
+
 ```bash
+cp ../.env.example ../.env   # once, at repository root
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 ```
 
