@@ -407,6 +407,15 @@ def apply_bytes_to_delta(
                 flush=True,
             )
             data = data[:-16]
+        # NDS retail saves are often 512 KiB (524288 B) in Delta; 3DS homebrew and some tools
+        # attach a small trailing block (metadata / alignment). Keep the leading 512 KiB only.
+        elif expected == 524288 and len(data) > expected and (len(data) - expected) <= 512:
+            print(
+                f"[delta-apply] trim {len(data)} -> {expected} bytes "
+                f"(NDS tail vs Delta 512 KiB slot) id={identifier[:8]}…",
+                flush=True,
+            )
+            data = data[:expected]
         else:
             raise ValueError(f"data {len(data)} bytes > Delta expected {expected}")
     if len(data) < expected:

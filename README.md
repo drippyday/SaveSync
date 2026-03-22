@@ -68,12 +68,13 @@ Not everyone needs this. If you sync with **Delta** or **Dropbox**, follow **`do
 | Doc | Purpose |
 |-----|---------|
 | **`docs/USER_GUIDE.md`** | Full setup: server, bridge, Switch, 3DS, Dropbox, troubleshooting |
-| **`docs/RELEASE_NOTES_v0.1.7.md`** | Latest release (**v0.1.7**): admin dashboard & save management, client save viewer, labels, keep/lock, Delta trim + packaging |
+| **`docs/RELEASE_NOTES_v0.1.8.md`** | Latest release (**v0.1.8**): NDS + GB/GBC multi-root sync, bridge DMG headers for Delta mapping, server Dropbox log passthrough |
 | **`docs/RELEASE_NOTES_v0.1.6.md`** | Prior console-focused release notes |
 | **`dist/README.md`** | What’s in release zips and where files go |
 | **`admin-web/README.md`** | Enabling and using the optional admin UI (`/admin/ui/`) |
 | **`docs/TODO.md`** | What’s shipped vs planned |
 | **`docs/HARDWARE_VALIDATION_CHECKLIST.md`** | Optional real-device test matrix (sync, conflicts, history) |
+| **`docs/CONSOLE_CLIENT_PERFORMANCE.md`** | Switch/3DS performance notes (HTTP, hashing, safe vs risky ideas) |
 | **`docs/RELEASE.md`** | How maintainers build and package releases |
 
 ---
@@ -83,10 +84,10 @@ Not everyone needs this. If you sync with **Delta** or **Dropbox**, follow **`do
 Release scripts (from repo root; **devkitPro** required for Switch/3DS):
 
 ```bash
-./scripts/release-server.sh v0.1.7
-./scripts/release-bridge.sh v0.1.7
-./scripts/release-switch.sh v0.1.7
-./scripts/release-3ds.sh v0.1.7
+./scripts/release-server.sh v0.1.8
+./scripts/release-bridge.sh v0.1.8
+./scripts/release-switch.sh v0.1.8
+./scripts/release-3ds.sh v0.1.8
 ```
 
 **Toolchain:** Python 3.11+ (server/bridge), Docker (server), devkitPro (`devkitA64`/`libnx` for Switch, `devkitARM`/`libctru` for 3DS), plus 3DS packaging tools for **`./scripts/release-3ds.sh`** (`makerom`, `bannertool`; `sips` on macOS for banner assets). See **`docs/RELEASE.md`** for detail.

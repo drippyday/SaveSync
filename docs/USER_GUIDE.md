@@ -157,7 +157,7 @@ GBASYNC_SERVER_DELTA_RECENT_SERVER_PROTECT_SECONDS=3600
 
 Use artifact:
 
-- `dist/switch/gbasync-switch-v0.1.7/gbasync.nro`
+- `dist/switch/gbasync-switch-v0.1.8/gbasync.nro`
 
 On SD card:
 
@@ -202,7 +202,7 @@ metroid-zero: DOWNLOADED
 
 Use artifact:
 
-- `dist/3ds/gbasync-3ds-v0.1.7/gbasync.3dsx`
+- `dist/3ds/gbasync-3ds-v0.1.8/gbasync.3dsx`
 
 On SD card:
 

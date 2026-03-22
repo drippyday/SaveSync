@@ -15,6 +15,7 @@ from delta_folder_server_sync import (  # noqa: E402
     _dedupe_plan_server_targets,
     _game_id_plan_for_server_delta,
 )
+from game_id import remote_game_id_for_delta_title  # noqa: E402
 
 
 def test_shared_header_assigns_retail_only_not_hack() -> None:
@@ -202,6 +203,45 @@ def test_hack_with_dedicated_server_row_gets_own_id() -> None:
 
     assert plan["HID_RETAIL"] == "pokemon-fire-bpre"
     assert plan["HID_HACK"] == "redrocket"
+
+
+def test_remote_game_id_matches_nds_upload_slug_when_header_differs() -> None:
+    """Device slug from filename must match Delta title when ROM header id is absent on server."""
+
+    remote = {
+        "pokemon---soulsilver-version--usa-": {
+            "sha256": "x",
+            "filename_hint": "Pokemon - SoulSilver Version (USA).sav",
+        },
+    }
+    got = remote_game_id_for_delta_title(
+        "Pokémon: SoulSilver Version", remote, header_hint="pokemon-ss-ipge"
+    )
+    assert got == "pokemon---soulsilver-version--usa-"
+
+
+def test_nds_non_collision_maps_filename_slug_not_header_code() -> None:
+    """Solo NDS row must not stick to pokemon-ss-ipge when server only has filename-based key."""
+
+    def log(msg: str) -> None:
+        pass
+
+    remote = {
+        "pokemon---soulsilver-version--usa-": {
+            "sha256": "x",
+            "filename_hint": "Pokemon - SoulSilver Version (USA).sav",
+        },
+    }
+    colliding: set[str] = set()
+    rom_to_gid = {"romsha1aa": "pokemon-ss-ipge"}
+    delta_by_rom = {
+        "romsha1aa": {
+            "identifier": "harmony-soulsilver",
+            "name": "Pokémon: SoulSilver Version",
+        },
+    }
+    plan = _game_id_plan_for_server_delta(delta_by_rom, rom_to_gid, remote, colliding, log)
+    assert plan["harmony-soulsilver"] == "pokemon---soulsilver-version--usa-"
 
 
 def test_retail_title_can_map_to_friendly_server_id_without_header_id() -> None:

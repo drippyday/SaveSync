@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <netdb.h>
 #include <sstream>
 #include <string>
@@ -28,10 +29,36 @@
 struct Config {
   std::string server_url = "http://10.0.0.151:8080";
   std::string api_key = "change-me";
+  /** Legacy single-root (GBA): used when gba_save_dir / nds_save_dir / gb_save_dir are unset. */
   std::string save_dir = "sdmc:/mGBA";
   std::string rom_dir = "sdmc:/mGBA";
   std::string rom_extension = ".gba";
+  /** ``normal``: multi-root below; ``vc``: Checkpoint-style GBA VC folder only. */
+  std::string sync_mode = "normal";
+  std::string vc_save_dir;
+  std::string gba_save_dir;
+  std::string nds_save_dir;
+  std::string gb_save_dir;
+  std::string gba_rom_dir;
+  std::string nds_rom_dir;
+  std::string gb_rom_dir;
+  std::string gba_rom_extension = ".gba";
+  std::string nds_rom_extension = ".nds";
+  std::string gb_rom_extension = ".gb";
+  /** When false, the NDS save root is omitted and .sav files that match an NDS ROM (see nds_rom_dir) or skip_save_patterns are ignored. */
+  bool sync_nds_saves = true;
+  /** Lowercased substrings; if any appear in the save filename stem, the file is skipped (any root). */
+  std::vector<std::string> skip_save_patterns;
   std::set<std::string> locked_ids;
+};
+
+enum class SaveRootKind { Gba, Nds, Gb };
+
+struct SaveRoot {
+  SaveRootKind kind = SaveRootKind::Gba;
+  std::string save_dir;
+  std::string rom_dir;
+  std::string rom_extension;
 };
 
 struct SaveMeta {
@@ -39,6 +66,7 @@ struct SaveMeta {
   std::string last_modified_utc;
   std::string server_updated_at;
   std::string sha256;
+  size_t size_bytes = 0;
   std::string filename_hint;
   std::string display_name;
 };
@@ -111,7 +139,24 @@ static Config load_config(const std::string& path) {
     const std::string value = trim(line.substr(split + 1));
     if (section == "server" && key == "url") cfg.server_url = value;
     if (section == "server" && key == "api_key") cfg.api_key = value;
+    if (section == "sync" && key == "mode") cfg.sync_mode = value;
     if (section == "sync" && key == "save_dir") cfg.save_dir = value;
+    if (section == "sync" && key == "vc_save_dir") cfg.vc_save_dir = value;
+    if (section == "sync" && key == "gba_save_dir") cfg.gba_save_dir = value;
+    if (section == "sync" && key == "nds_save_dir") cfg.nds_save_dir = value;
+    if (section == "sync" && key == "sync_nds_saves") {
+      const std::string v = to_lower(value);
+      cfg.sync_nds_saves = !(v == "0" || v == "false" || v == "no" || v == "off");
+    }
+    if (section == "sync" && key == "skip_save_patterns") {
+      std::stringstream ss(value);
+      std::string tok;
+      while (std::getline(ss, tok, ',')) {
+        tok = trim(tok);
+        if (!tok.empty()) cfg.skip_save_patterns.push_back(to_lower(tok));
+      }
+    }
+    if (section == "sync" && key == "gb_save_dir") cfg.gb_save_dir = value;
     if (section == "sync" && key == "locked_ids") {
       std::stringstream ss(value);
       std::string tok;
@@ -122,6 +167,12 @@ static Config load_config(const std::string& path) {
     }
     if (section == "rom" && key == "rom_dir") cfg.rom_dir = value;
     if (section == "rom" && key == "rom_extension") cfg.rom_extension = value;
+    if (section == "rom" && key == "gba_rom_dir") cfg.gba_rom_dir = value;
+    if (section == "rom" && key == "nds_rom_dir") cfg.nds_rom_dir = value;
+    if (section == "rom" && key == "gb_rom_dir") cfg.gb_rom_dir = value;
+    if (section == "rom" && key == "gba_rom_extension") cfg.gba_rom_extension = value;
+    if (section == "rom" && key == "nds_rom_extension") cfg.nds_rom_extension = value;
+    if (section == "rom" && key == "gb_rom_extension") cfg.gb_rom_extension = value;
   }
   return cfg;
 }
@@ -136,6 +187,16 @@ static std::string sanitize_game_id(const std::string& stem) {
     }
   }
   while (!out.empty() && out.front() == '-') out.erase(out.begin());
+  while (!out.empty() && out.back() == '-') out.pop_back();
+  return out.empty() ? "unknown-game" : out;
+}
+
+/**
+ * Delta / server JSON sometimes uses a trailing ``-`` on ``game_id``; local ``sanitize_game_id`` strips it.
+ * Without this, merge sees two ids for one save (upload one key, download the other) forever.
+ */
+static std::string canonical_game_id(const std::string& id) {
+  std::string out = id;
   while (!out.empty() && out.back() == '-') out.pop_back();
   return out.empty() ? "unknown-game" : out;
 }
@@ -172,6 +233,16 @@ static std::string game_id_from_rom_header(const std::vector<unsigned char>& rom
   return sanitize_game_id(combined);
 }
 
+/* NDS cartridge header @ 0x00 title (12), 0x0C game code (4) — mirror bridge/game_id.py / 3DS client. */
+static std::string game_id_from_nds_rom_header(const std::vector<unsigned char>& rom_data) {
+  if (rom_data.size() < 0x10) return "";
+  const std::string title = decode_header_field(rom_data.data() + 0x00, 12);
+  const std::string code = decode_header_field(rom_data.data() + 0x0C, 4);
+  if (title.empty() && code.empty()) return "";
+  const std::string combined = code.empty() ? title : (title + "-" + code);
+  return sanitize_game_id(combined);
+}
+
 /* ROM title/gamecode live in the first ~0xB0 bytes; avoid reading multi‑MiB ROMs per save. */
 static std::vector<unsigned char> read_file_prefix(const std::string& path, size_t max_bytes) {
   std::ifstream file(path, std::ios::binary);
@@ -182,18 +253,216 @@ static std::vector<unsigned char> read_file_prefix(const std::string& path, size
   return out;
 }
 
-static std::string resolve_game_id_for_save(const Config& cfg, const std::string& save_name) {
-  const std::string stem = file_stem(save_name);
-  if (!cfg.rom_dir.empty()) {
-    std::string ext = cfg.rom_extension.empty() ? ".gba" : cfg.rom_extension;
-    if (!ext.empty() && ext[0] != '.') ext = "." + ext;
-    const std::string rom_path = cfg.rom_dir + "/" + stem + ext;
+static void strip_trailing_slashes(std::string* s) {
+  while (!s->empty() && (s->back() == '/' || s->back() == '\\')) s->pop_back();
+}
+
+static std::vector<SaveRoot> build_save_roots(const Config& cfg) {
+  std::vector<SaveRoot> out;
+  if (strcasecmp(cfg.sync_mode.c_str(), "vc") == 0) {
+    SaveRoot r;
+    r.kind = SaveRootKind::Gba;
+    r.save_dir = cfg.vc_save_dir;
+    r.rom_dir = cfg.rom_dir;
+    r.rom_extension = cfg.rom_extension.empty() ? ".gba" : cfg.rom_extension;
+    strip_trailing_slashes(&r.save_dir);
+    strip_trailing_slashes(&r.rom_dir);
+    out.push_back(std::move(r));
+    return out;
+  }
+  const bool multi = !cfg.gba_save_dir.empty() || !cfg.nds_save_dir.empty() || !cfg.gb_save_dir.empty();
+  if (multi) {
+    if (!cfg.gba_save_dir.empty()) {
+      SaveRoot r;
+      r.kind = SaveRootKind::Gba;
+      r.save_dir = cfg.gba_save_dir;
+      r.rom_dir = cfg.gba_rom_dir;
+      r.rom_extension = cfg.gba_rom_extension.empty() ? ".gba" : cfg.gba_rom_extension;
+      strip_trailing_slashes(&r.save_dir);
+      strip_trailing_slashes(&r.rom_dir);
+      out.push_back(std::move(r));
+    }
+    if (!cfg.nds_save_dir.empty() && cfg.sync_nds_saves) {
+      SaveRoot r;
+      r.kind = SaveRootKind::Nds;
+      r.save_dir = cfg.nds_save_dir;
+      r.rom_dir = cfg.nds_rom_dir;
+      r.rom_extension = cfg.nds_rom_extension.empty() ? ".nds" : cfg.nds_rom_extension;
+      strip_trailing_slashes(&r.save_dir);
+      strip_trailing_slashes(&r.rom_dir);
+      out.push_back(std::move(r));
+    }
+    if (!cfg.gb_save_dir.empty()) {
+      SaveRoot r;
+      r.kind = SaveRootKind::Gb;
+      r.save_dir = cfg.gb_save_dir;
+      r.rom_dir = cfg.gb_rom_dir;
+      r.rom_extension = cfg.gb_rom_extension.empty() ? ".gb" : cfg.gb_rom_extension;
+      strip_trailing_slashes(&r.save_dir);
+      strip_trailing_slashes(&r.rom_dir);
+      out.push_back(std::move(r));
+    }
+    if (out.empty()) {
+      SaveRoot r;
+      r.kind = SaveRootKind::Gba;
+      r.save_dir = cfg.save_dir;
+      r.rom_dir = cfg.rom_dir;
+      r.rom_extension = cfg.rom_extension.empty() ? ".gba" : cfg.rom_extension;
+      strip_trailing_slashes(&r.save_dir);
+      strip_trailing_slashes(&r.rom_dir);
+      out.push_back(std::move(r));
+    }
+    return out;
+  }
+  SaveRoot r;
+  r.kind = SaveRootKind::Gba;
+  r.save_dir = cfg.save_dir;
+  r.rom_dir = cfg.rom_dir;
+  r.rom_extension = cfg.rom_extension.empty() ? ".gba" : cfg.rom_extension;
+  strip_trailing_slashes(&r.save_dir);
+  strip_trailing_slashes(&r.rom_dir);
+  out.push_back(std::move(r));
+  return out;
+}
+
+static std::string first_save_dir(const Config& cfg) {
+  auto roots = build_save_roots(cfg);
+  if (!roots.empty()) return roots[0].save_dir;
+  return cfg.save_dir;
+}
+
+/** Default extension per root kind when ``rom_extension`` is empty. */
+static const char* default_rom_ext_for_kind(SaveRootKind kind) {
+  switch (kind) {
+    case SaveRootKind::Gba:
+      return ".gba";
+    case SaveRootKind::Nds:
+      return ".nds";
+    case SaveRootKind::Gb:
+      return ".gb";
+  }
+  return ".gba";
+}
+
+/**
+ * One or more ROM suffixes: ``.gb`` or ``.gb,.gbc`` (comma-separated).
+ * Tried in order when resolving headers / download target folder.
+ */
+static std::vector<std::string> rom_extensions_list(const std::string& raw, const char* default_ext) {
+  std::string def = default_ext ? default_ext : ".gba";
+  if (!def.empty() && def[0] != '.') def = "." + def;
+  if (raw.find(',') == std::string::npos) {
+    std::string e = raw.empty() ? def : raw;
+    if (!e.empty() && e[0] != '.') e = "." + e;
+    return {e};
+  }
+  std::vector<std::string> out;
+  std::stringstream ss(raw);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    tok = trim(tok);
+    if (tok.empty()) continue;
+    if (tok[0] != '.') tok = "." + tok;
+    out.push_back(tok);
+  }
+  if (out.empty()) out.push_back(def);
+  return out;
+}
+
+static bool path_is_regular_file(const std::string& path) {
+  struct stat st {};
+  if (stat(path.c_str(), &st) != 0) return false;
+  return S_ISREG(st.st_mode);
+}
+
+/** If ``nds_rom_dir`` has ``stem`` + NDS extension, this save is for that NDS title (mixed mGBA folder). */
+static bool nds_rom_exists_for_stem(const Config& cfg, const std::string& stem) {
+  if (cfg.nds_rom_dir.empty()) return false;
+  std::string base = cfg.nds_rom_dir;
+  strip_trailing_slashes(&base);
+  const auto exts = rom_extensions_list(cfg.nds_rom_extension, ".nds");
+  for (const auto& ext : exts) {
+    if (path_is_regular_file(base + "/" + stem + ext)) return true;
+  }
+  return false;
+}
+
+/**
+ * Retail DS saves are often exactly 512 KiB (e.g. Pokémon). GBA .sav is almost never that large.
+ * Used when ``sync_nds_saves=false`` so mixed mGBA folders can skip NDS without manual patterns.
+ */
+static bool nds_retail_save_size_bytes(std::uint64_t n) {
+  return n == 524288ULL;
+}
+
+static bool nds_skip_when_sync_off_by_size(const Config& cfg, std::uint64_t size_bytes) {
+  return !cfg.sync_nds_saves && nds_retail_save_size_bytes(size_bytes);
+}
+
+static bool matches_skip_patterns(const std::string& text, const std::vector<std::string>& patterns) {
+  if (patterns.empty()) return false;
+  const std::string s = to_lower(text);
+  for (const auto& p : patterns) {
+    if (p.empty()) continue;
+    if (s.find(p) != std::string::npos) return true;
+  }
+  return false;
+}
+
+static bool should_skip_sav_sync(const Config& cfg, const std::string& stem) {
+  if (matches_skip_patterns(stem, cfg.skip_save_patterns)) return true;
+  if (!cfg.sync_nds_saves && nds_rom_exists_for_stem(cfg, stem)) return true;
+  return false;
+}
+
+static bool is_skipped_merge_id(const Config& cfg, const std::string& id) {
+  return matches_skip_patterns(id, cfg.skip_save_patterns);
+}
+
+static bool should_skip_remote_for_nds_policy(const Config& cfg, const SaveMeta& m) {
+  if (cfg.sync_nds_saves) return false;
+  if (m.size_bytes == 0) return false;
+  return nds_retail_save_size_bytes(static_cast<std::uint64_t>(m.size_bytes));
+}
+
+static std::vector<std::string> build_merge_ids_filtered(
+    const Config& cfg,
+    const std::map<std::string, LocalSave>& local_by_id,
+    const std::map<std::string, SaveMeta>& remote) {
+  std::vector<std::string> merge_ids;
+  merge_ids.reserve(local_by_id.size() + remote.size());
+  for (const auto& [id, _] : local_by_id) {
+    if (!is_skipped_merge_id(cfg, id)) merge_ids.push_back(id);
+  }
+  for (const auto& [id, meta] : remote) {
+    if (local_by_id.count(id)) continue;
+    if (is_skipped_merge_id(cfg, id)) continue;
+    if (should_skip_remote_for_nds_policy(cfg, meta)) continue;
+    merge_ids.push_back(id);
+  }
+  std::sort(merge_ids.begin(), merge_ids.end());
+  return merge_ids;
+}
+
+static std::string resolve_game_id_for_save_root(const SaveRoot& root, const std::string& stem) {
+  if (root.rom_dir.empty()) return sanitize_game_id(stem);
+  const auto exts = rom_extensions_list(root.rom_extension, default_rom_ext_for_kind(root.kind));
+  for (const auto& ext : exts) {
+    const std::string rom_path = root.rom_dir + "/" + stem + ext;
     const std::vector<unsigned char> rom_hdr = read_file_prefix(rom_path, 512);
-    if (rom_hdr.size() >= 0xB0) {
-      const std::string from_header = game_id_from_rom_header(rom_hdr);
-      if (!from_header.empty()) return from_header;
+    if (root.kind == SaveRootKind::Nds) {
+      if (rom_hdr.size() >= 0x10) {
+        const std::string from_nds = game_id_from_nds_rom_header(rom_hdr);
+        if (!from_nds.empty()) return from_nds;
+      }
+    } else if (root.kind == SaveRootKind::Gba) {
+      if (rom_hdr.size() >= 0xB0) {
+        const std::string from_gba = game_id_from_rom_header(rom_hdr);
+        if (!from_gba.empty()) return from_gba;
+      }
     }
   }
+  /* GB / fallback: stem only (same as 3DS). */
   return sanitize_game_id(stem);
 }
 
@@ -250,49 +519,114 @@ static constexpr uint32_t K[64] = {
     0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
     0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U};
 static inline uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
-static std::string hash(const std::vector<unsigned char>& data) {
-  uint64_t bit_len = static_cast<uint64_t>(data.size()) * 8U;
-  std::vector<unsigned char> msg = data;
-  msg.push_back(0x80);
-  while ((msg.size() % 64) != 56) msg.push_back(0x00);
-  for (int i = 7; i >= 0; --i) msg.push_back(static_cast<unsigned char>((bit_len >> (i * 8)) & 0xffU));
-  uint32_t h0 = 0x6a09e667U, h1 = 0xbb67ae85U, h2 = 0x3c6ef372U, h3 = 0xa54ff53aU;
-  uint32_t h4 = 0x510e527fU, h5 = 0x9b05688cU, h6 = 0x1f83d9abU, h7 = 0x5be0cd19U;
-  for (size_t chunk = 0; chunk < msg.size(); chunk += 64) {
-    uint32_t w[64] = {0};
-    for (int i = 0; i < 16; ++i) {
-      size_t j = chunk + static_cast<size_t>(i) * 4;
-      w[i] = (uint32_t(msg[j]) << 24) | (uint32_t(msg[j + 1]) << 16) | (uint32_t(msg[j + 2]) << 8) | uint32_t(msg[j + 3]);
-    }
-    for (int i = 16; i < 64; ++i) {
-      uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-      uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
-    uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
-    for (int i = 0; i < 64; ++i) {
-      uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-      uint32_t ch = (e & f) ^ ((~e) & g);
-      uint32_t temp1 = h + s1 + ch + K[i] + w[i];
-      uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-      uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-      uint32_t temp2 = s0 + maj;
-      h = g;
-      g = f;
-      f = e;
-      e = d + temp1;
-      d = c;
-      c = b;
-      b = a;
-      a = temp1 + temp2;
-    }
-    h0 += a; h1 += b; h2 += c; h3 += d; h4 += e; h5 += f; h6 += g; h7 += h;
+
+static void sha256_compress(uint32_t h[8], const uint8_t block[64]) {
+  uint32_t w[64] = {0};
+  for (int i = 0; i < 16; ++i) {
+    const size_t j = static_cast<size_t>(i) * 4;
+    w[i] = (uint32_t(block[j]) << 24) | (uint32_t(block[j + 1]) << 16) | (uint32_t(block[j + 2]) << 8) | uint32_t(block[j + 3]);
   }
+  for (int i = 16; i < 64; ++i) {
+    const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+    const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+  }
+  uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+  for (int i = 0; i < 64; ++i) {
+    const uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+    const uint32_t ch = (e & f) ^ ((~e) & g);
+    const uint32_t temp1 = hh + s1 + ch + K[i] + w[i];
+    const uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+    const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+    const uint32_t temp2 = s0 + maj;
+    hh = g;
+    g = f;
+    f = e;
+    e = d + temp1;
+    d = c;
+    c = b;
+    b = a;
+    a = temp1 + temp2;
+  }
+  h[0] += a;
+  h[1] += b;
+  h[2] += c;
+  h[3] += d;
+  h[4] += e;
+  h[5] += f;
+  h[6] += g;
+  h[7] += hh;
+}
+
+static std::string digest_to_hex(const uint32_t h[8]) {
   std::ostringstream out;
   out << std::hex << std::setfill('0');
-  out << std::setw(8) << h0 << std::setw(8) << h1 << std::setw(8) << h2 << std::setw(8) << h3
-      << std::setw(8) << h4 << std::setw(8) << h5 << std::setw(8) << h6 << std::setw(8) << h7;
+  out << std::setw(8) << h[0] << std::setw(8) << h[1] << std::setw(8) << h[2] << std::setw(8) << h[3]
+      << std::setw(8) << h[4] << std::setw(8) << h[5] << std::setw(8) << h[6] << std::setw(8) << h[7];
   return out.str();
+}
+
+/** Incremental SHA-256: same digest as buffering the whole message, without holding the file in RAM. */
+struct Sha256 {
+  uint64_t total_bytes = 0;
+  uint8_t buf[64]{};
+  size_t buf_len = 0;
+  uint32_t h[8] = {0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+                     0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
+
+  void update(const uint8_t* data, size_t len) {
+    total_bytes += len;
+    while (len > 0) {
+      const size_t n = std::min(len, static_cast<size_t>(64 - buf_len));
+      std::memcpy(buf + buf_len, data, n);
+      buf_len += n;
+      data += n;
+      len -= n;
+      if (buf_len == 64) {
+        sha256_compress(h, buf);
+        buf_len = 0;
+      }
+    }
+  }
+
+  std::string finalize() {
+    const uint64_t bit_len = total_bytes * 8U;
+    std::vector<unsigned char> tail;
+    tail.insert(tail.end(), buf, buf + buf_len);
+    tail.push_back(0x80);
+    while ((tail.size() % 64) != 56) tail.push_back(0x00);
+    for (int i = 7; i >= 0; --i) tail.push_back(static_cast<unsigned char>((bit_len >> (i * 8)) & 0xffU));
+    for (size_t chunk = 0; chunk < tail.size(); chunk += 64) {
+      sha256_compress(h, tail.data() + chunk);
+    }
+    return digest_to_hex(h);
+  }
+};
+
+static std::string hash(const std::vector<unsigned char>& data) {
+  Sha256 s;
+  if (!data.empty()) s.update(data.data(), data.size());
+  return s.finalize();
+}
+
+/** Hash file in chunks; ``*out_bytes`` matches bytes hashed (same as a full read). Returns false on open failure. */
+static bool digest_file(const std::string& path, std::string* out_hex, size_t* out_bytes) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  Sha256 s;
+  size_t total = 0;
+  unsigned char chunk[65536];
+  while (f) {
+    f.read(reinterpret_cast<char*>(chunk), sizeof(chunk));
+    const std::streamsize n = f.gcount();
+    if (n > 0) {
+      s.update(chunk, static_cast<size_t>(n));
+      total += static_cast<size_t>(n);
+    }
+  }
+  *out_hex = s.finalize();
+  *out_bytes = total;
+  return true;
 }
 }  // namespace sha256_impl
 
@@ -554,7 +888,7 @@ static std::map<std::string, SaveMeta> parse_saves_json(const std::string& json)
     const auto next_gid = json.find("\"game_id\":\"", gend + 1);
     const size_t win_end = (next_gid == std::string::npos) ? json.size() : next_gid;
     SaveMeta meta{};
-    meta.game_id = json.substr(gstart, gend - gstart);
+    meta.game_id = canonical_game_id(json.substr(gstart, gend - gstart));
     const std::string chunk = json.substr(gend, win_end - gend);
 
     const auto ts = chunk.find("\"last_modified_utc\":\"");
@@ -586,6 +920,14 @@ static std::map<std::string, SaveMeta> parse_saves_json(const std::string& json)
       const auto dstart = dn + 16;
       const auto dend = chunk.find('"', dstart);
       if (dend != std::string::npos) meta.display_name = chunk.substr(dstart, dend - dstart);
+    }
+    const auto sz = chunk.find("\"size_bytes\":");
+    if (sz != std::string::npos) {
+      size_t i = sz + 13;
+      while (i < chunk.size() && (chunk[i] == ' ' || chunk[i] == '\t')) i++;
+      size_t j = i;
+      while (j < chunk.size() && std::isdigit(static_cast<unsigned char>(chunk[j]))) j++;
+      if (j > i) meta.size_bytes = static_cast<size_t>(std::strtoull(chunk.substr(i, j - i).c_str(), nullptr, 10));
     }
     out[meta.game_id] = meta;
     pos = win_end;
@@ -896,6 +1238,42 @@ static std::string id_map_lookup(const std::vector<IdMapRow>& rows, const std::s
   return "";
 }
 
+/**
+ * Old clients could write ``stem -> stem-2`` when multi-root scanned the same folder twice.
+ * If only one save uses this stem, that suffix is stale — ignore the map entry so we re-resolve
+ * to the canonical id (matches server and avoids paired UPLOAD/DOWNLOAD rows).
+ */
+static bool is_stale_disambiguation_suffix(
+    const std::string& mapped_id, const std::string& stem, int stem_count) {
+  if (stem_count != 1 || mapped_id.empty()) return false;
+  const std::string stem_id = sanitize_game_id(stem);
+  if (mapped_id.size() <= stem_id.size() + 1) return false;
+  if (mapped_id.compare(0, stem_id.size(), stem_id) != 0) return false;
+  if (mapped_id[stem_id.size()] != '-') return false;
+  for (size_t i = stem_id.size() + 1; i < mapped_id.size(); ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(mapped_id[i]))) return false;
+  }
+  return true;
+}
+
+/** Same physical ``.sav`` can be scanned once per configured root (e.g. GBA + GB same folder). */
+static std::vector<LocalSave> dedupe_local_saves_by_path_keep_last(std::vector<LocalSave>&& in) {
+  std::unordered_map<std::string, size_t> path_to_idx;
+  path_to_idx.reserve(in.size());
+  std::vector<LocalSave> out;
+  out.reserve(in.size());
+  for (auto& s : in) {
+    auto it = path_to_idx.find(s.path);
+    if (it == path_to_idx.end()) {
+      path_to_idx.emplace(s.path, out.size());
+      out.push_back(std::move(s));
+    } else {
+      out[it->second] = std::move(s);
+    }
+  }
+  return out;
+}
+
 static bool id_map_upsert(std::vector<IdMapRow>& rows, const std::string& stem, const std::string& gid) {
   for (auto& r : rows) {
     if (r.save_stem == stem) {
@@ -908,14 +1286,21 @@ static bool id_map_upsert(std::vector<IdMapRow>& rows, const std::string& stem, 
   return true;
 }
 
-static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::string& dir) {
-  std::vector<LocalSave> out;
+/** Scan one save directory (with a root for ROM header resolution). Appends to ``accum`` for multi-root. */
+static void scan_local_saves_in_dir(
+    const SaveRoot& root,
+    const std::string& dir,
+    const Config& cfg,
+    std::vector<LocalSave>& accum) {
+  /* Suffix disambiguation (``firered-2``) only when two saves in *this* directory map to the same
+   * game_id. Seeding from other roots was wrong: the same stem/ID across GBA/GB/NDS dirs must share
+   * one server id, not get suffixed and duplicate auto sync rows. */
   std::map<std::string, int> used_ids;
   std::vector<IdMapRow> id_map = id_map_load(dir);
   bool id_map_changed = false;
   std::vector<std::string> names;
   DIR* d = opendir(dir.c_str());
-  if (!d) return out;
+  if (!d) return;
   dirent* ent = nullptr;
   while ((ent = readdir(d)) != nullptr) {
     std::string name(ent->d_name);
@@ -925,17 +1310,28 @@ static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::str
   closedir(d);
   std::sort(names.begin(), names.end());
 
+  std::map<std::string, int> stem_count;
+  for (const auto& name : names) {
+    stem_count[file_stem(name)]++;
+  }
+
   for (const auto& name : names) {
     LocalSave s{};
     s.name = name;
     s.path = dir + "/" + name;
     const std::string stem = file_stem(name);
-    const std::string mapped_id = id_map_lookup(id_map, stem);
-    const std::string resolved_id = resolve_game_id_for_save(cfg, name);
+    if (should_skip_sav_sync(cfg, stem)) continue;
+    struct stat st{};
+    if (stat(s.path.c_str(), &st) != 0) continue;
+    if (nds_skip_when_sync_off_by_size(cfg, static_cast<std::uint64_t>(st.st_size))) continue;
+    std::string mapped_id = id_map_lookup(id_map, stem);
+    if (!mapped_id.empty()) mapped_id = canonical_game_id(mapped_id);
+    if (is_stale_disambiguation_suffix(mapped_id, stem, stem_count[stem])) mapped_id.clear();
+    const std::string resolved_id = resolve_game_id_for_save_root(root, stem);
     const std::string fallback_id = sanitize_game_id(stem);
     std::string chosen_id = mapped_id.empty() ? (resolved_id.empty() ? fallback_id : resolved_id) : mapped_id;
     if (used_ids.find(chosen_id) != used_ids.end()) {
-      // Ensure unique IDs per local save even when ROM headers collide.
+      // Same directory only: two .sav files resolved to the same id (e.g. same ROM header).
       std::string base = fallback_id.empty() ? chosen_id : fallback_id;
       if (base.empty()) base = "unknown-game";
       chosen_id = base;
@@ -944,45 +1340,54 @@ static std::vector<LocalSave> scan_local_saves(const Config& cfg, const std::str
         chosen_id = base + "-" + std::to_string(suffix++);
       }
     }
+    chosen_id = canonical_game_id(chosen_id);
     id_map_changed = id_map_upsert(id_map, stem, chosen_id) || id_map_changed;
     used_ids[chosen_id] = 1;
     s.game_id = chosen_id;
-    struct stat st{};
-    if (stat(s.path.c_str(), &st) != 0) continue;
     s.st_mtime_unix = static_cast<std::int64_t>(st.st_mtime);
     if (st.st_mtime == 0) {
-      // Some SD/FAT stacks leave mtime at epoch = "unset"; file can still be new.
       s.last_modified_utc = mtime_to_utc_iso(std::time(nullptr));
       s.mtime_trusted = true;
     } else {
       s.last_modified_utc = mtime_to_utc_iso(st.st_mtime);
-      s.mtime_trusted = (st.st_mtime >= 946684800L);  // ignore pre-2000 mtimes (common bogus FAT values)
+      s.mtime_trusted = (st.st_mtime >= 946684800L);
     }
-    std::vector<unsigned char> bytes = read_file(s.path);
-    s.size_bytes = bytes.size();
-    s.sha256 = sha256_impl::hash(bytes);
-    out.push_back(s);
+    std::string dig;
+    size_t sz = 0;
+    if (!sha256_impl::digest_file(s.path, &dig, &sz)) continue;
+    s.size_bytes = sz;
+    s.sha256 = std::move(dig);
+    accum.push_back(std::move(s));
   }
   if (id_map_changed) (void)id_map_save(dir, id_map);
-  return out;
 }
 
-static std::string baseline_file_path(const Config& cfg) {
-  std::string d = cfg.save_dir;
-  while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+static std::vector<LocalSave> scan_all_local_saves(const Config& cfg) {
+  std::vector<LocalSave> out;
+  auto roots = build_save_roots(cfg);
+  for (const auto& r : roots) {
+    if (r.save_dir.empty()) continue;
+    scan_local_saves_in_dir(r, r.save_dir, cfg, out);
+  }
+  return dedupe_local_saves_by_path_keep_last(std::move(out));
+}
+
+static std::string baseline_file_path_for_dir(const std::string& save_dir) {
+  std::string d = save_dir;
+  strip_trailing_slashes(&d);
   return d + "/.gbasync-baseline";
 }
 
-static std::string baseline_legacy_file_path(const Config& cfg) {
-  std::string d = cfg.save_dir;
-  while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+static std::string baseline_legacy_file_path_for_dir(const std::string& save_dir) {
+  std::string d = save_dir;
+  strip_trailing_slashes(&d);
   return d + "/.savesync-baseline";
 }
 
-static std::vector<BaselineRow> baseline_load(const Config& cfg) {
+static std::vector<BaselineRow> baseline_load_dir(const std::string& save_dir) {
   std::vector<BaselineRow> rows;
-  std::ifstream in(baseline_file_path(cfg));
-  if (!in) in.open(baseline_legacy_file_path(cfg));
+  std::ifstream in(baseline_file_path_for_dir(save_dir));
+  if (!in) in.open(baseline_legacy_file_path_for_dir(save_dir));
   std::string line;
   while (rows.size() < 256 && std::getline(in, line)) {
     const auto tab = line.find('\t');
@@ -991,13 +1396,15 @@ static std::vector<BaselineRow> baseline_load(const Config& cfg) {
     std::string sha = line.substr(tab + 1);
     while (!sha.empty() && (sha.back() == '\r' || sha.back() == '\n')) sha.pop_back();
     if (gid.empty() || sha.size() != 64) continue;
-    rows.push_back({std::move(gid), std::move(sha)});
+    rows.push_back({canonical_game_id(gid), std::move(sha)});
   }
   return rows;
 }
 
-static bool baseline_save(const Config& cfg, const std::vector<BaselineRow>& rows) {
-  const std::string path = baseline_file_path(cfg);
+static void baseline_upsert(std::vector<BaselineRow>& rows, const std::string& id, const std::string& sha);
+
+static bool baseline_save_dir(const std::string& save_dir, const std::vector<BaselineRow>& rows) {
+  const std::string path = baseline_file_path_for_dir(save_dir);
   const std::string tmp = path + ".tmp";
   std::ofstream out(tmp);
   if (!out) return false;
@@ -1008,8 +1415,7 @@ static bool baseline_save(const Config& cfg, const std::vector<BaselineRow>& row
     std::remove(tmp.c_str());
     return false;
   }
-  // Keep the legacy baseline file in sync so older client builds continue to work.
-  const std::string legacy_path = baseline_legacy_file_path(cfg);
+  const std::string legacy_path = baseline_legacy_file_path_for_dir(save_dir);
   const std::string legacy_tmp = legacy_path + ".tmp";
   std::ofstream legacy_out(legacy_tmp);
   if (legacy_out) {
@@ -1019,6 +1425,73 @@ static bool baseline_save(const Config& cfg, const std::vector<BaselineRow>& row
     if (std::rename(legacy_tmp.c_str(), legacy_path.c_str()) != 0) std::remove(legacy_tmp.c_str());
   }
   return true;
+}
+
+static std::vector<BaselineRow> baseline_load_merged(const Config& cfg) {
+  std::vector<BaselineRow> merged;
+  auto roots = build_save_roots(cfg);
+  for (const auto& r : roots) {
+    if (r.save_dir.empty()) continue;
+    for (const auto& row : baseline_load_dir(r.save_dir)) baseline_upsert(merged, row.game_id, row.sha256);
+  }
+  if (merged.empty() && !cfg.save_dir.empty()) {
+    for (const auto& row : baseline_load_dir(cfg.save_dir)) baseline_upsert(merged, row.game_id, row.sha256);
+  }
+  return merged;
+}
+
+static int save_dir_cmp(const std::string& a, const std::string& b) {
+  std::string x = a;
+  std::string y = b;
+  strip_trailing_slashes(&x);
+  strip_trailing_slashes(&y);
+  return x.compare(y);
+}
+
+static std::string pick_baseline_root_for_game(
+    const Config& cfg,
+    const std::string& game_id,
+    const std::vector<LocalSave>& locals) {
+  auto roots = build_save_roots(cfg);
+  if (roots.empty()) return cfg.save_dir;
+  for (const auto& loc : locals) {
+    if (loc.game_id != game_id) continue;
+    const std::string* best = &roots[0].save_dir;
+    size_t best_len = 0;
+    for (const auto& root : roots) {
+      std::string r = root.save_dir;
+      strip_trailing_slashes(&r);
+      const size_t plen = r.size();
+      if (plen > best_len && loc.path.size() >= plen && loc.path.compare(0, plen, r) == 0 &&
+          (loc.path.size() == plen || loc.path[plen] == '/')) {
+        best = &root.save_dir;
+        best_len = plen;
+      }
+    }
+    return *best;
+  }
+  return roots[0].save_dir;
+}
+
+static bool baseline_save_merged(
+    const Config& cfg,
+    const std::vector<BaselineRow>& rows,
+    const std::vector<LocalSave>& locals) {
+  auto roots = build_save_roots(cfg);
+  if (roots.empty()) return baseline_save_dir(cfg.save_dir, rows);
+  bool ok = true;
+  for (const auto& root : roots) {
+    if (root.save_dir.empty()) continue;
+    std::vector<BaselineRow> subset;
+    for (const auto& r : rows) {
+      const std::string want = pick_baseline_root_for_game(cfg, r.game_id, locals);
+      if (save_dir_cmp(want, root.save_dir) == 0) subset.push_back(r);
+    }
+    if (!subset.empty()) {
+      if (!baseline_save_dir(root.save_dir, subset)) ok = false;
+    }
+  }
+  return ok;
 }
 
 static bool baseline_get_sha(const std::vector<BaselineRow>& rows, const std::string& id, std::string* out_sha) {
@@ -1042,8 +1515,8 @@ static void baseline_upsert(std::vector<BaselineRow>& rows, const std::string& i
 }
 
 static std::string gbasync_status_path(const Config& cfg) {
-  std::string d = cfg.save_dir;
-  while (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+  std::string d = first_save_dir(cfg);
+  strip_trailing_slashes(&d);
   return d + "/.gbasync-status";
 }
 
@@ -1452,11 +1925,14 @@ static bool put_save_log(const Config& cfg,
                          const LocalSave& l,
                          bool force,
                          const std::string& platform,
-                         std::vector<std::string>& logs) {
+                         std::vector<std::string>& logs,
+                         std::string* out_uploaded_sha = nullptr) {
   const std::vector<unsigned char> bytes = read_file(l.path);
+  const std::string computed_sha = sha256_impl::hash(bytes);
+  const size_t size_bytes = bytes.size();
   std::ostringstream path;
   path << "/save/" << l.game_id << "?last_modified_utc=" << url_encode_simple(l.last_modified_utc)
-       << "&sha256=" << url_encode_simple(l.sha256) << "&size_bytes=" << l.size_bytes
+       << "&sha256=" << url_encode_simple(computed_sha) << "&size_bytes=" << size_bytes
        << "&filename_hint=" << url_encode_simple(l.name) << "&platform_source=" << platform
        << "&client_clock_utc=" << url_encode_simple(mtime_to_utc_iso(std::time(nullptr)));
   if (force) path << "&force=1";
@@ -1474,15 +1950,16 @@ static bool put_save_log(const Config& cfg,
   }
   if (jsonBodyAppliedIsTrue(bv) || !jsonBodyHasAppliedMember(bv)) {
     logs.push_back(l.game_id + ": UPLOADED");
+    if (out_uploaded_sha) *out_uploaded_sha = computed_sha;
     return true;
   }
-  bool ok = bodyContainsSha256Value(body, l.sha256);
+  bool ok = bodyContainsSha256Value(body, computed_sha);
   if (!ok) {
     std::vector<unsigned char> meta_body;
     int mst = 0;
     if (http_request(cfg, "GET", "/save/" + l.game_id + "/meta", {}, mst, meta_body) && mst == 200) {
       const std::string mb(meta_body.begin(), meta_body.end());
-      ok = bodyContainsSha256Value(mb, l.sha256);
+      ok = bodyContainsSha256Value(mb, computed_sha);
     }
   }
   if (!ok) {
@@ -1490,14 +1967,55 @@ static bool put_save_log(const Config& cfg,
     return false;
   }
   logs.push_back(l.game_id + ": UPLOADED");
+  if (out_uploaded_sha) *out_uploaded_sha = computed_sha;
   return true;
 }
 
-static bool get_save_log(const Config& cfg, const std::string& id, const SaveMeta& r, std::vector<std::string>& logs) {
+static void pick_download_dir_switch(
+    const Config& cfg,
+    const std::string& game_id,
+    const SaveMeta& r,
+    const std::vector<LocalSave>& locals,
+    std::string* out_dir) {
+  for (const auto& loc : locals) {
+    if (loc.game_id != game_id) continue;
+    const auto slash = loc.path.find_last_of('/');
+    if (slash != std::string::npos) {
+      *out_dir = loc.path.substr(0, slash);
+      return;
+    }
+  }
+  std::string fallback_name = game_id + ".sav";
+  std::string target_name = r.filename_hint.empty() ? fallback_name : sanitize_filename(r.filename_hint, fallback_name);
+  if (!has_sav_extension(target_name)) target_name += ".sav";
+  const std::string stem = file_stem(target_name);
+  auto roots = build_save_roots(cfg);
+  for (const auto& root : roots) {
+    if (root.rom_dir.empty()) continue;
+    for (const auto& ext : rom_extensions_list(root.rom_extension, default_rom_ext_for_kind(root.kind))) {
+      const std::string rom_path = root.rom_dir + "/" + stem + ext;
+      std::ifstream test(rom_path);
+      if (test.good()) {
+        *out_dir = root.save_dir;
+        return;
+      }
+    }
+  }
+  *out_dir = roots.empty() ? cfg.save_dir : roots[0].save_dir;
+}
+
+static bool get_save_log(
+    const Config& cfg,
+    const std::string& id,
+    const SaveMeta& r,
+    std::vector<std::string>& logs,
+    const std::vector<LocalSave>& locals) {
+  std::string dest_dir;
+  pick_download_dir_switch(cfg, id, r, locals, &dest_dir);
   std::string fallback_name = id + ".sav";
   std::string target_name = r.filename_hint.empty() ? fallback_name : sanitize_filename(r.filename_hint, fallback_name);
   if (!has_sav_extension(target_name)) target_name += ".sav";
-  const std::string target_path = cfg.save_dir + "/" + target_name;
+  const std::string target_path = dest_dir + "/" + target_name;
   std::vector<unsigned char> save_data;
   int get_status = 0;
   if (!http_request(cfg, "GET", "/save/" + id, {}, get_status, save_data) || get_status != 200) {
@@ -1518,6 +2036,7 @@ static void resolve_both_changed_conflict_switch(PadState* pad,
                                                  const LocalSave& l,
                                                  const SaveMeta& r,
                                                  const std::string& plat,
+                                                 const std::vector<LocalSave>& locals,
                                                  std::vector<std::string>& logs,
                                                  std::vector<BaselineRow>& baseline) {
   consoleClear();
@@ -1532,11 +2051,12 @@ static void resolve_both_changed_conflict_switch(PadState* pad,
     padUpdate(pad);
     const u64 down = padGetButtonsDown(pad);
     if (down & HidNpadButton_X) {
-      if (put_save_log(cfg, l, true, plat, logs)) baseline_upsert(baseline, id, l.sha256);
+      std::string uploaded_sha;
+      if (put_save_log(cfg, l, true, plat, logs, &uploaded_sha)) baseline_upsert(baseline, id, uploaded_sha);
       break;
     }
     if (down & HidNpadButton_Y) {
-      if (get_save_log(cfg, id, r, logs)) baseline_upsert(baseline, id, r.sha256);
+      if (get_save_log(cfg, id, r, logs, locals)) baseline_upsert(baseline, id, r.sha256);
       break;
     }
     if (down & HidNpadButton_B) break;
@@ -1545,7 +2065,14 @@ static void resolve_both_changed_conflict_switch(PadState* pad,
 }
 
 static bool pick_upload_selection(PadState* pad, const Config& cfg, SyncManualFilter* out) {
-  auto locals = scan_local_saves(cfg, cfg.save_dir);
+  auto locals_all = scan_all_local_saves(cfg);
+  std::vector<LocalSave> locals;
+  locals.reserve(locals_all.size());
+  for (auto& s : locals_all) {
+    if (should_skip_sav_sync(cfg, file_stem(s.name))) continue;
+    if (is_skipped_merge_id(cfg, s.game_id)) continue;
+    locals.push_back(std::move(s));
+  }
   if (locals.empty()) {
     printf("No local .sav files to upload.\n");
     return false;
@@ -1649,7 +2176,15 @@ static bool pick_download_selection(PadState* pad, const Config& cfg, SyncManual
   }
   std::vector<std::pair<std::string, SaveMeta>> rows;
   rows.reserve(remote.size());
-  for (const auto& kv : remote) rows.push_back(kv);
+  for (const auto& kv : remote) {
+    if (is_skipped_merge_id(cfg, kv.first)) continue;
+    if (should_skip_remote_for_nds_policy(cfg, kv.second)) continue;
+    rows.push_back(kv);
+  }
+  if (rows.empty()) {
+    printf("No remote saves to download (all filtered).\n");
+    return false;
+  }
   std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
 
   const int n = static_cast<int>(rows.size());
@@ -1737,7 +2272,7 @@ static bool pick_download_selection(PadState* pad, const Config& cfg, SyncManual
 }
 
 static void save_viewer_switch(PadState* pad, Config& cfg) {
-  auto locals = scan_local_saves(cfg, cfg.save_dir);
+  auto locals = scan_all_local_saves(cfg);
   std::map<std::string, LocalSave> local_by_id;
   for (const auto& s : locals) local_by_id[s.game_id] = s;
   int status = 0;
@@ -1757,13 +2292,7 @@ static void save_viewer_switch(PadState* pad, Config& cfg) {
   }
   std::string json(body.begin(), body.end());
   auto remote = parse_saves_json(json);
-  std::vector<std::string> merge_ids;
-  merge_ids.reserve(local_by_id.size() + remote.size());
-  for (const auto& [id, _] : local_by_id) merge_ids.push_back(id);
-  for (const auto& [id, _] : remote) {
-    if (!local_by_id.count(id)) merge_ids.push_back(id);
-  }
-  std::sort(merge_ids.begin(), merge_ids.end());
+  std::vector<std::string> merge_ids = build_merge_ids_filtered(cfg, local_by_id, remote);
   if (merge_ids.empty()) {
     consoleClear();
     printf("Save viewer: no saves (local or server).\n");
@@ -1864,14 +2393,14 @@ static std::vector<std::string> run_sync(
     printf("Scanning local saves...\n");
     consoleUpdate(NULL);
   }
-  auto local = scan_local_saves(cfg, cfg.save_dir);
+  auto local = scan_all_local_saves(cfg);
   std::map<std::string, LocalSave> local_by_id;
   for (const auto& s : local) local_by_id[s.game_id] = s;
   if (action != SyncAction::Auto) {
     logs.push_back("Local saves: " + std::to_string(local.size()));
   }
 
-  std::vector<BaselineRow> baseline = baseline_load(cfg);
+  std::vector<BaselineRow> baseline = baseline_load_merged(cfg);
 
   int status = 0;
   std::vector<unsigned char> body;
@@ -1896,33 +2425,32 @@ static std::vector<std::string> run_sync(
 
   if (action == SyncAction::UploadOnly) {
     for (const auto& entry : local_by_id) {
+      if (is_skipped_merge_id(cfg, entry.first)) continue;
       if (xy_filter && !xy_filter->all && !xy_filter->ids.count(entry.first)) continue;
-      if (put_save_log(cfg, entry.second, true, plat, logs))
-        baseline_upsert(baseline, entry.first, entry.second.sha256);
+      std::string uploaded_sha;
+      if (put_save_log(cfg, entry.second, true, plat, logs, &uploaded_sha))
+        baseline_upsert(baseline, entry.first, uploaded_sha);
     }
-    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .gbasync-baseline");
+    if (!baseline_save_merged(cfg, baseline, local)) logs.push_back("WARN: could not write .gbasync-baseline");
     sync_status_after_server_work(cfg, true, true, "");
     return logs;
   }
 
   if (action == SyncAction::DownloadOnly) {
     for (const auto& [id, r] : remote) {
+      if (is_skipped_merge_id(cfg, id)) continue;
+      if (should_skip_remote_for_nds_policy(cfg, r)) continue;
       if (xy_filter && !xy_filter->all && !xy_filter->ids.count(id)) continue;
-      if (get_save_log(cfg, id, r, logs)) baseline_upsert(baseline, id, r.sha256);
+      if (get_save_log(cfg, id, r, logs, local)) baseline_upsert(baseline, id, r.sha256);
     }
-    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .gbasync-baseline");
+    if (!baseline_save_merged(cfg, baseline, local)) logs.push_back("WARN: could not write .gbasync-baseline");
     sync_status_after_server_work(cfg, true, true, "");
     return logs;
   }
 
   /* Auto: hash + .gbasync-baseline (legacy .savesync-baseline still read). */
   debug_report_sync_start_switch(cfg, local);
-  std::vector<std::string> merge_ids;
-  merge_ids.reserve(local_by_id.size() + remote.size());
-  for (const auto& [id, _] : local_by_id) merge_ids.push_back(id);
-  for (const auto& [id, _] : remote) {
-    if (!local_by_id.count(id)) merge_ids.push_back(id);
-  }
+  std::vector<std::string> merge_ids = build_merge_ids_filtered(cfg, local_by_id, remote);
 
   std::vector<AutoPlanRow> plan;
   build_auto_plan_vector(cfg, merge_ids, local_by_id, remote, baseline, plan);
@@ -1938,7 +2466,7 @@ static std::vector<std::string> run_sync(
         baseline_upsert(baseline, id, lit->second.sha256);
       }
     }
-    if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .gbasync-baseline");
+    if (!baseline_save_merged(cfg, baseline, local)) logs.push_back("WARN: could not write .gbasync-baseline");
     sync_status_after_server_work(cfg, true, true, "");
     logs.push_back("");
     logs.push_back("Already Up To Date");
@@ -1981,25 +2509,27 @@ static std::vector<std::string> run_sync(
       const bool loc_eq = (strcasecmp(l.sha256.c_str(), base_sha.c_str()) == 0);
       const bool rem_eq = (strcasecmp(r.sha256.c_str(), base_sha.c_str()) == 0);
       if (loc_eq && !rem_eq) {
-        if (get_save_log(cfg, id, r, logs)) baseline_upsert(baseline, id, r.sha256);
+        if (get_save_log(cfg, id, r, logs, local)) baseline_upsert(baseline, id, r.sha256);
       } else if (!loc_eq && rem_eq) {
-        if (put_save_log(cfg, l, false, plat, logs)) baseline_upsert(baseline, id, l.sha256);
+        std::string uploaded_sha;
+        if (put_save_log(cfg, l, false, plat, logs, &uploaded_sha)) baseline_upsert(baseline, id, uploaded_sha);
       } else if (!loc_eq && !rem_eq) {
         if (pad) {
-          resolve_both_changed_conflict_switch(pad, cfg, id, l, r, plat, logs, baseline);
+          resolve_both_changed_conflict_switch(pad, cfg, id, l, r, plat, local, logs, baseline);
         } else {
           logs.push_back(id + ": SKIP (both changed — need interactive resolution)");
         }
       }
     } else if (has_l && !has_r) {
-      if (put_save_log(cfg, lit->second, false, plat, logs))
-        baseline_upsert(baseline, id, lit->second.sha256);
+      std::string uploaded_sha;
+      if (put_save_log(cfg, lit->second, false, plat, logs, &uploaded_sha))
+        baseline_upsert(baseline, id, uploaded_sha);
     } else if (!has_l && has_r) {
-      if (get_save_log(cfg, id, rit->second, logs)) baseline_upsert(baseline, id, rit->second.sha256);
+      if (get_save_log(cfg, id, rit->second, logs, local)) baseline_upsert(baseline, id, rit->second.sha256);
     }
   }
 
-  if (!baseline_save(cfg, baseline)) logs.push_back("WARN: could not write .gbasync-baseline");
+  if (!baseline_save_merged(cfg, baseline, local)) logs.push_back("WARN: could not write .gbasync-baseline");
   sync_status_after_server_work(cfg, true, true, "");
   return logs;
 }
@@ -2108,10 +2638,23 @@ int main(int argc, char** argv) {
   } else {
     while (appletMainLoop() && !quit_app) {
       consoleClear();
-      printf("GBA Sync (Switch MVP)\n");
-      printf("---------------------\n");
+      printf("GBAsync (Switch)\n");
+      printf("-----------------\n");
       printf("Server: %s\n", cfg.server_url.c_str());
-      printf("Save dir: %s\n", cfg.save_dir.c_str());
+      {
+        auto roots = build_save_roots(cfg);
+        if (roots.empty()) {
+          printf("Save dir: %s\n", cfg.save_dir.c_str());
+        } else if (roots.size() == 1U) {
+          printf("Save dir: %s\n", roots[0].save_dir.c_str());
+        } else {
+          printf("Save dirs (%zu):\n", roots.size());
+          for (const auto& r : roots) {
+            const char* tag = r.kind == SaveRootKind::Gba ? "GBA" : (r.kind == SaveRootKind::Nds ? "NDS" : "GB");
+            printf("  [%s] %s\n", tag, r.save_dir.c_str());
+          }
+        }
+      }
       printf("\n");
       sync_status_print_menu(cfg);
       {

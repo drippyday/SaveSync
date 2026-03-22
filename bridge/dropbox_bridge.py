@@ -194,7 +194,8 @@ class DropboxServerBridge:
                 self._upload_server(game_id, data, filename, local_ts)
 
         remote_srv = self._list_remote_server()
-        drop_map = self._list_dropbox_savs()
+        # First loop only uploads to the GBAsync server — it never mutates Dropbox, so the prior
+        # download snapshot is still valid; re-listing would duplicate every files_download.
         drop_by_id = {gid: (p, m, d) for gid, (p, m, d) in drop_map.items()}
 
         for game_id, meta in remote_srv.items():

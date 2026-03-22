@@ -20,6 +20,8 @@ import json
 import re
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from pathlib import Path
 
@@ -51,13 +53,42 @@ def _remote_rel_path(remote_folder: str, path_display: str) -> str | None:
     return pd[len(pref) :]
 
 
+_CHUNK = 1024 * 1024
+
+
+def _sha256_file(path: Path) -> str:
+    """SHA-256 of file contents (same digest as ``hashlib.sha256(read_bytes())``)."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(_CHUNK)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _sha256_and_bytes(path: Path) -> tuple[str, bytes]:
+    """One pass over disk: digest + full bytes (for uploads). Same SHA-256 as ``_sha256_file``."""
+    h = hashlib.sha256()
+    buf = bytearray()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(_CHUNK)
+            if not b:
+                break
+            h.update(b)
+            buf.extend(b)
+    return h.hexdigest(), bytes(buf)
+
+
 def _snapshot_files(root: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for p in root.rglob("*"):
         if not p.is_file():
             continue
         rel = p.relative_to(root).as_posix()
-        out[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        out[rel] = _sha256_file(p)
     return out
 
 
@@ -109,8 +140,13 @@ def _set_sidecar_version_identifier(sidecar: Path, version_identifier: str) -> b
 
 
 def pull_delta_folder(dbx: dropbox.Dropbox, remote_folder: str, dest: Path) -> None:
+    """List the remote tree, then download with two workers (separate Dropbox clients per thread).
+
+    ``files_download_to_file`` streams to disk; ``ThreadPoolExecutor(2)`` overlaps network waits.
+    """
     remote_folder = _norm_remote_folder(remote_folder)
     dest.mkdir(parents=True, exist_ok=True)
+    jobs: list[tuple[str, Path]] = []
     result = dbx.files_list_folder(remote_folder, recursive=True)
     while True:
         for ent in result.entries:
@@ -120,12 +156,29 @@ def pull_delta_folder(dbx: dropbox.Dropbox, remote_folder: str, dest: Path) -> N
             if not rel:
                 continue
             local = dest / rel
-            local.parent.mkdir(parents=True, exist_ok=True)
-            _, res = dbx.files_download(ent.path_display)
-            local.write_bytes(res.content)
+            jobs.append((ent.path_display, local))
         if not result.has_more:
             break
         result = dbx.files_list_folder_continue(result.cursor)
+
+    if not jobs:
+        return
+
+    thread_local = threading.local()
+
+    def _thread_dbx() -> dropbox.Dropbox:
+        if getattr(thread_local, "client", None) is None:
+            thread_local.client = make_dropbox_client()
+        return thread_local.client
+
+    def _download_one(job: tuple[str, Path]) -> None:
+        path_display, local = job
+        local.parent.mkdir(parents=True, exist_ok=True)
+        # download_path = local disk, path = Dropbox (SDK parameter names).
+        _thread_dbx().files_download_to_file(str(local), path_display)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(_download_one, jobs))
 
 
 def push_changed_files(
@@ -137,22 +190,35 @@ def push_changed_files(
     log: Callable[[str], None],
 ) -> None:
     remote_folder = _norm_remote_folder(remote_folder)
-    changed: list[Path] = []
-    for p in sorted(local_root.rglob("*"), key=lambda x: str(x)):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(local_root).as_posix()
-        data = p.read_bytes()
-        h = hashlib.sha256(data).hexdigest()
-        if before.get(rel) == h:
-            continue
-        changed.append(p)
 
     def _is_gamesave_json_sidecar(path: Path) -> bool:
         n = path.name
         if not (n.startswith("GameSave-") or n.startswith("gamesave-")):
             return False
         return not n.endswith("-gameSave") and not n.endswith("-gamesave")
+
+    files_sorted = sorted(
+        (p for p in local_root.rglob("*") if p.is_file()),
+        key=str,
+    )
+
+    changed: list[Path] = []
+    # Bytes for changed non-sidecars only — one chunked read via _sha256_and_bytes (sidecars may be
+    # rewritten by _set_sidecar_version_identifier before final upload, so those stay read fresh).
+    blob_payload: dict[Path, bytes] = {}
+    for p in files_sorted:
+        rel = p.relative_to(local_root).as_posix()
+        if _is_gamesave_json_sidecar(p):
+            h = _sha256_file(p)
+            if before.get(rel) == h:
+                continue
+            changed.append(p)
+        else:
+            h, data = _sha256_and_bytes(p)
+            if before.get(rel) == h:
+                continue
+            changed.append(p)
+            blob_payload[p] = data
 
     # Upload blobs first, JSON sidecars last. This narrows the window where Delta could read a
     # freshly-uploaded GameSave JSON whose referenced blob has not arrived yet.
@@ -164,7 +230,7 @@ def push_changed_files(
 
     for p in changed_non_sidecars:
         rel = p.relative_to(local_root).as_posix()
-        data = p.read_bytes()
+        data = blob_payload[p]
         remote_path = f"{remote_folder}/{rel}"
         if dry_run:
             log(f"[dry-run] upload {remote_path} ({len(data)} B)")
@@ -176,10 +242,7 @@ def push_changed_files(
         log(f"[dropbox] upload {remote_path} ({len(data)} B)")
 
     sidecars_to_upload: dict[str, Path] = {str(p): p for p in changed_sidecars}
-    all_sidecars: list[Path] = []
-    for p in sorted(local_root.rglob("*"), key=lambda x: str(x)):
-        if p.is_file() and _is_gamesave_json_sidecar(p):
-            all_sidecars.append(p)
+    all_sidecars: list[Path] = [p for p in files_sorted if _is_gamesave_json_sidecar(p)]
 
     for sidecar in all_sidecars:
         gid = _gamesave_json_identifier(sidecar)

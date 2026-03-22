@@ -90,3 +90,32 @@ def test_apply_bytes_to_delta_trims_mgba_16_byte_footer_for_128k_slot(tmp_path: 
     assert canonical_blob.read_bytes() == old
     updated = json.loads(meta_path.read_text(encoding="utf-8"))
     assert updated["files"][0]["sha1Hash"] == hashlib.sha1(old).hexdigest()
+
+
+def test_apply_bytes_to_delta_trims_nds_small_overrun_for_512k_slot(tmp_path: Path) -> None:
+    """3DS uploads can be 512 KiB + small tail; Delta Harmony expects exactly 524288 B."""
+    identifier = "f8dc38ea20c17541a43b58c5e6d18c1732c7e582"
+    canonical_blob = tmp_path / f"GameSave-{identifier}-gameSave"
+    meta_path = tmp_path / f"GameSave-{identifier}"
+
+    old = b"B" * 524288
+    canonical_blob.write_bytes(old)
+    meta_path.write_text(
+        json.dumps(
+            _meta_for(
+                identifier=identifier,
+                remote_identifier=f"/delta emulator/{canonical_blob.name}",
+                size=524288,
+                sha1_hex=hashlib.sha1(old).hexdigest(),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    padded = old + b"\x00" * 122
+    assert len(padded) == 524410
+    apply_bytes_to_delta(tmp_path, identifier, padded, backup_dir=None)
+
+    assert canonical_blob.read_bytes() == old
+    updated = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert updated["files"][0]["sha1Hash"] == hashlib.sha1(old).hexdigest()

@@ -83,6 +83,9 @@ class SaveStore:
         self.keep_history = keep_history
         self.history_max_per_game = max(0, int(history_max_per_game))
         self._lock = Lock()
+        # In-memory index cache: skip json.load when index.json mtime+size unchanged (see _read_index_state).
+        self._index_cache_sig: tuple[int, int] | None = None
+        self._index_cache_state: _IndexState | None = None
         self.save_root.mkdir(parents=True, exist_ok=True)
         self.history_root.mkdir(parents=True, exist_ok=True)
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,10 +107,20 @@ class SaveStore:
         except (json.JSONDecodeError, OSError, UnicodeError):
             self._write_index_state(_IndexState(saves={}, aliases={}, rom_sha1={}, tombstones={}))
 
-    def _read_index_state(self) -> _IndexState:
+    def _index_disk_signature(self) -> tuple[int, int] | None:
+        """Return (mtime_ns, size) for index.json, or None if missing/unreadable."""
         try:
-            if not self.index_path.is_file() or self.index_path.stat().st_size == 0:
-                return _IndexState(saves={}, aliases={}, rom_sha1={}, tombstones={})
+            st = self.index_path.stat()
+        except OSError:
+            return None
+        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+        return (mtime_ns, int(st.st_size))
+
+    def _load_index_state_from_disk(self, sig: tuple[int, int] | None) -> _IndexState:
+        """Parse index.json; ``sig`` comes from a single prior ``stat`` (see _read_index_state)."""
+        if sig is None or sig[1] == 0:
+            return _IndexState(saves={}, aliases={}, rom_sha1={}, tombstones={})
+        try:
             with self.index_path.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if not isinstance(data, dict):
@@ -137,6 +150,15 @@ class SaveStore:
         except (json.JSONDecodeError, OSError, UnicodeError):
             return _IndexState(saves={}, aliases={}, rom_sha1={}, tombstones={})
 
+    def _read_index_state(self) -> _IndexState:
+        sig = self._index_disk_signature()
+        if self._index_cache_state is not None and self._index_cache_sig == sig:
+            return self._index_cache_state
+        state = self._load_index_state_from_disk(sig)
+        self._index_cache_state = state
+        self._index_cache_sig = sig
+        return state
+
     def _write_index_state(self, state: _IndexState) -> None:
         tmp = self.index_path.with_suffix(".tmp")
         payload: dict[str, object]
@@ -152,6 +174,8 @@ class SaveStore:
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
         os.replace(tmp, self.index_path)
+        self._index_cache_state = state
+        self._index_cache_sig = self._index_disk_signature()
 
     @staticmethod
     def _normalize_game_id(game_id: str) -> str:

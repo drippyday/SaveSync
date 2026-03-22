@@ -81,6 +81,29 @@ def remote_game_id_for_delta_title(
             return remote_stem_map[nk]
     if header_hint and header_hint in remote and title_looks_like_retail_for_header(name, header_hint):
         return header_hint
+
+    # NDS retail: ROM header uses cartridge code (e.g. ``pokemon-ss-ipge``) while 3DS/Switch uploads
+    # often use a filename-based slug (e.g. ``pokemon---soulsilver-version--usa-``). When the Delta
+    # display title does not slug-match the server key, align via distinctive words in ``filename_hint``.
+    name_tokens = [
+        w
+        for w in re.split(r"[^a-z0-9]+", (name or "").lower())
+        if len(w) >= 5 and w not in stop_words
+    ]
+    if name_tokens:
+        matched: list[str] = []
+        for gid, meta in remote.items():
+            if not isinstance(meta, dict):
+                continue
+            hint = str(meta.get("filename_hint") or "").strip()
+            if not hint:
+                continue
+            stem_l = Path(hint).stem.lower()
+            if all(t in stem_l for t in name_tokens):
+                matched.append(str(gid))
+        if len(matched) == 1:
+            return matched[0]
+
     return None
 
 
@@ -120,12 +143,35 @@ def game_id_from_nds_bytes(data: bytes) -> str | None:
     return sanitize_game_id(joined)
 
 
+def game_id_from_gb_bytes(data: bytes) -> str | None:
+    """DMG/GBC cartridge header: title @ 0x0134 (11 chars on CGB; up to 16 on older DMG)."""
+    if len(data) < 0x0144:
+        return None
+    # 0x0143 is CGB compatibility flag on GBC; title is then 0x0134-0x013E (11 bytes).
+    if data[0x0143] in (0x80, 0xC0):
+        title = _decode_ascii_field(data[0x0134:0x013F])
+    else:
+        title = _decode_ascii_field(data[0x0134:0x0144])
+    if not title:
+        return None
+    return sanitize_game_id(title)
+
+
 def game_id_from_rom_bytes(data: bytes) -> str | None:
-    """Derive GBAsync ``game_id`` from ROM bytes: GBA header first, then NDS."""
+    """Derive GBAsync ``game_id`` from ROM bytes: GB/DMG when plausible, then GBA, then NDS."""
+    # Retail GBA ROMs are usually 4MB+; try GB first for smaller blobs so DMG/GBC titles win.
+    if len(data) >= 0x144 and len(data) < 4 * 1024 * 1024:
+        gb = game_id_from_gb_bytes(data)
+        if gb:
+            return gb
     if len(data) >= 0xB0:
         gba = game_id_from_gba_bytes(data)
         if gba:
             return gba
+    if len(data) >= 0x144:
+        gb = game_id_from_gb_bytes(data)
+        if gb:
+            return gb
     if len(data) >= 0x20:
         return game_id_from_nds_bytes(data)
     return None
@@ -143,6 +189,8 @@ def _rom_sha1_and_game_id(rom: Path) -> tuple[str, str] | None:
     gid: str | None = None
     if ext == ".nds":
         gid = game_id_from_nds_bytes(raw)
+    elif ext in (".gb", ".gbc"):
+        gid = game_id_from_gb_bytes(raw)
     elif len(raw) >= 0xB0:
         gid = game_id_from_gba_bytes(raw)
     if h and gid:
@@ -158,6 +206,7 @@ def build_rom_sha1_to_game_id(
     """Map lower-case ROM SHA-1 -> GBAsync ``game_id`` (GBA header).
 
     Scans ``rom_dirs`` (recursive) and optionally every ROM path listed in ``rom_map_path`` JSON.
+    Uses GBA / NDS / GB cartridge headers as appropriate for each file extension.
     """
     out: dict[str, str] = {}
     seen: set[Path] = set()
@@ -235,10 +284,19 @@ class GameIdResolver:
         """Resolve ``game_id`` from a save filename stem (no filesystem path required)."""
         rom_path = self._match_via_map(save_stem) or self._match_via_dirs(save_stem)
         if rom_path:
+            ext = rom_path.suffix.lower()
+            if ext in (".gb", ".gbc"):
+                try:
+                    b = rom_path.read_bytes()
+                except OSError:
+                    b = b""
+                gb = game_id_from_gb_bytes(b)
+                if gb:
+                    return gb
             derived = game_id_from_gba_rom(rom_path)
             if derived:
                 return derived
-            if rom_path.suffix.lower() == ".nds":
+            if ext == ".nds":
                 try:
                     b = rom_path.read_bytes()
                 except OSError:

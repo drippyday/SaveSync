@@ -1,6 +1,6 @@
 # GBAsync — TODO / backlog
 
-**Latest release notes:** `docs/RELEASE_NOTES_v0.1.7.md` (prior: `docs/RELEASE_NOTES_v0.1.6.md`)
+**Latest release notes:** `docs/RELEASE_NOTES_v0.1.8.md` (prior: `docs/RELEASE_NOTES_v0.1.7.md`)
 
 ## Recently completed (sync UX + server)
 

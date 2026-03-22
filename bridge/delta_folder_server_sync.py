@@ -365,7 +365,14 @@ def _game_id_plan_for_server_delta(
         hid = row["identifier"]
         if hid in plan:
             continue
-        plan[hid] = header_gid
+        name = str(row.get("name") or "")
+        name_key = remote_game_id_for_delta_title(name, remote, header_hint=header_gid)
+        if name_key:
+            plan[hid] = name_key
+        elif header_gid in remote:
+            plan[hid] = header_gid
+        else:
+            plan[hid] = header_gid
 
     _dedupe_plan_server_targets(plan, delta_by_rom, rom_to_gid, remote, log)
 

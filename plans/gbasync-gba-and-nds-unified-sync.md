@@ -1,133 +1,132 @@
-# Plan: Unified GBA + NDS save sync (single config, no profile switching)
+# Plan: Unified GBA + NDS (+ GB) save sync (single config, no profile switching)
 
-**Status:** investigation + implementation plan (no code in this step).  
-**Goal:** Sync **Game Boy Advance** and **Nintendo DS** `.sav` files in **one** GBAsync run on **3DS** (Twilight Menu) and **Switch**, without maintaining separate `config.ini` copies or manual switching.
+**Status:** **3DS `mode=normal`:** **`gba_*` / `nds_*` / `gb_*`** save + ROM roots, NDS cartridge header IDs, per-root baselines. **`mode=vc`:** unchanged (`vc_save_dir` + `[rom]`). **Switch:** **GBA only** — single **`save_dir`** + **`rom_dir`** (no NDS, no multi-root, no DS sync).
 
-**Compatibility:** No requirement to preserve legacy **`save_dir`** / **`rom_dir`** keys — **clean break** acceptable; migrate the single existing install to the new schema by hand.
+**Goal:** Sync **GBA** and **NDS** `.sav` in **one** session on **3DS** without swapping config. **Switch** stays a **GBA-only** single-folder client.
+
+**Compatibility:** **Clean break** for `config.ini` is acceptable — no obligation to keep monolithic `[sync] save_dir` / `[rom] rom_dir` forever. Migrate existing installs by hand once the new schema ships.
 
 ---
 
-## 0. Recommended config schema (clean break)
+## 0. Snapshot — current codebase (verify before coding)
 
-Per-platform pairs (omit unused systems):
+Use this section to avoid stale assumptions.
 
-| Role | Example keys |
-|------|----------------|
+| Layer | GBA | NDS | Notes |
+|-------|-----|-----|--------|
+| **Server** | Blob + string `game_id` | Same | No format restriction; large DS carts OK. |
+| **Bridge** `bridge/game_id.py` | `game_id_from_gba_bytes` @ 0xA0 / 0xAC | `game_id_from_nds_bytes` @ 0x00 / 0x0C | `_rom_sha1_and_game_id` picks parser by **`.nds`** suffix. `game_id_from_rom_bytes` tries GBA then NDS. |
+| **Switch** `switch-client/source/main.cpp` | GBA header @ 0xA0 / 0xAC | **Not supported** | Single **`save_dir`** / **`rom_dir`** / **`rom_extension`** only. |
+| **3DS** `3ds-client/source/main.c` | `game_id_from_gba_rom_header_bytes` | `game_id_from_nds_rom_header_bytes` | **`mode=vc`:** single GBA root (`vc_save_dir` + `[rom]`). **`mode=normal`:** optional multi-root **`gba_*` / `nds_*` / `gb_*`**; **`scan_all_local_saves`**. |
+| **Delta trim** `bridge/delta_dropbox_sav.py` | 131088 → 131072 when Harmony expects 128 KiB | **Do not** apply GBA trim to DS blobs | DS sizes are **per-title** in Harmony; log mismatches, don’t reuse GBA rule. |
+
+**Implication:** Multi-system sync is implemented on **3DS** only. **Switch** remains GBA-only; use **3DS** (or server/bridge) for NDS + GBA combined workflows.
+
+---
+
+## 1. Recommended config schema (clean break)
+
+Per-system **optional** pairs (omit systems you don’t use):
+
+| Role | Keys |
+|------|------|
 | Saves | `gba_save_dir`, `nds_save_dir`, `gb_save_dir` |
 | ROMs | `gba_rom_dir`, `nds_rom_dir`, `gb_rom_dir` |
-| Extension | `gba_rom_extension`, `nds_rom_extension`, `gb_rom_extension` (defaults e.g. `.gba`, `.nds`, `.gb`) |
+| Extensions | `gba_rom_extension`, `nds_rom_extension`, `gb_rom_extension` (defaults e.g. `.gba`, `.nds`, `.gb`) |
 
-- **Scan:** union of `*.sav` under each **set** `*_save_dir` (non-recursive by default unless opted in).
-- **`game_id` resolution:** knows **which system** from which root the save came from → try matching ROM under the corresponding `*_rom_dir` with that extension → **NDS / GBA / GB** header rules or stem fallback.
-- **Drop** monolithic `[sync] save_dir` + `[rom] rom_dir` in favor of this layout (or keep **only** as internal aliases during a short transition — **not** required if breaking compat).
+**Scan:** union of `*.sav` under each **set** `*_save_dir` (see §3.1 for recursion default).
+
+**`game_id` resolution:** the **system** is determined by **which configured save root** contained the file (longest-prefix wins if paths are nested — **document:** avoid overlapping roots).
+
+**3DS `mode=vc` today:** maps to “which single root is active.” Future design should either (a) fold VC exports into `gba_save_dir` (if still GBA), or (b) add explicit `vc_save_dir` as an alias of one of the `*_save_dir` keys — **decide in Phase A** so we don’t ship two conflicting stories.
+
+**Drop:** monolithic `[sync] save_dir` + `[rom] rom_dir` in favor of the above (short-lived compatibility shims optional, not required).
 
 ---
 
-## 1. Problem statement
+## 2. Problem statement
 
 ### User constraints
 
-- **Twilight Menu** on 3DS; saves may live under paths such as:
-  - `roms/nds/saves/<name>.sav` (NDS)
-  - `roms/gb/<name>.sav` (GB / GBA layout as used on-card — exact layout is user-defined)
-- ROM trees: `roms/nds`, `roms/gb` (or similar).
-- **Requirement:** GBA and NDS **at the same time** — not “sync GBA today, swap config, sync NDS tomorrow.”
+- **Twilight Menu** / **nds-bootstrap** often use layouts like:
+  - `.../nds/saves/<title>.sav` next to ROMs, or a centralized saves folder
+  - GBA saves under `.../gba/` or `.../gb/` depending on the user
+- **Requirement:** GBA and NDS **in one run** — not “sync GBA today, edit config, sync NDS tomorrow.”
 
 ### Current product limits
 
-| Area | Today | Blocker for unified GBA+NDS |
-|------|--------|-----------------------------|
-| **`[sync] save_dir`** | Single directory scanned for `*.sav` | One folder cannot cover `nds/saves` and `gb/` unless a **parent** is chosen and rules are defined for recursion/subfolders. |
-| **`[rom] rom_dir` + `rom_extension`** | Single ROM root + one extension (e.g. `.gba`) | NDS ROMs live under **`roms/nds`** with **`.nds`**; GBA under **`roms/gb`** with **`.gba`**. One pair cannot describe both without extension. |
-| **ROM header → `game_id` (3DS/Switch)** | **GBA-only** offsets (`0xA0` / `0xAC`) | Feeding **NDS** bytes through GBA parsing yields **wrong or empty** `game_id`. |
-| **Bridge `game_id.py`** | Already has **`game_id_from_nds_bytes`** and `.nds` handling in ROM maps | Handheld clients do **not** yet mirror this. |
-| **Server** | Opaque blobs + string `game_id` | **No** GBA-only restriction; OK for DS sizes. |
-| **Delta / Harmony trim** | **131088 → 131072** for GBA/mGBA | DS uses **per-game** sizes in Harmony — separate concern; no shared trim rule. |
+| Area | Today | Blocker |
+|------|--------|---------|
+| Single `save_dir` | One tree of `*.sav` | Cannot represent disjoint TM paths without a parent + recursion rules. |
+| Single `rom_dir` + `rom_extension` | One extension (e.g. `.gba`) | Cannot locate both `.gba` and `.nds` for stem matching. |
+| Handheld header code | GBA-only offsets | NDS ROM fed through GBA parser → **wrong or empty** `game_id`; must branch like Python. |
+| Bridge | Already multi-system | Clients must **catch up** for parity with Dropbox / `rom_map` workflows. |
 
 ---
 
-## 2. Investigation summary (feasibility)
+## 3. Design options
 
-### 2.1 Server
+### 3.1 Per-system save + ROM dirs (recommended)
 
-- **Feasible without schema migration:** `PUT /save/{game_id}` accepts arbitrary binary length; index stores metadata as today.
-- **Optional later:** `platform` or `system` hint in metadata for admin UX (not required for MVP).
+- **Named keys** (§1) — clearer than comma-separated `save_dirs=`.
+- **Default scan:** **non-recursive** per `*_save_dir` (Twilight often uses flat `saves/`). Optional later: `save_scan_recursive=true` or per-root flags.
+- **Baseline / `.gbasync-baseline` / `.gbasync-idmap`:** either:
+  - **A)** one pair of files **per** `*_save_dir` root (simplest mental model), or
+  - **B)** a **single** merged file under a chosen “primary” root with keys that include relative path — **pick A or B in Phase A** before coding.
 
-### 2.2 Bridge / desktop
+### 3.2 `game_id` resolution (mirror `bridge/game_id.py`)
 
-- **Already:** `game_id_from_nds_bytes`, `game_id_from_rom_bytes` (GBA then NDS fallback in one helper — order matters for ambiguous files), `_rom_sha1_and_game_id` branches on **`.nds`**.
-- **Work:** Ensure **`delta_folder_server_sync` / slot maps** can associate DS titles with server `game_id` the same way as GBA (ROM SHA-1, title hints). Validate against real Harmony exports for a few DS games.
+For each local `.sav`:
 
-### 2.3 Handheld clients (3DS / Switch)
+1. Determine **system** from which `*_save_dir` matched.
+2. Build ROM path: `{*_rom_dir}/{stem}{*_rom_extension}` for that system.
+3. Read prefix (512 bytes is enough for GBA and NDS cartridge headers):
+   - If extension is **`.nds`** → **NDS** parser: title **12 bytes @ 0x00**, game code **4 bytes @ 0x0C** (see `game_id_from_nds_bytes` in `bridge/game_id.py`).
+   - Else if **`.gba`** / **`.gb`** → **GBA** parser @ 0xA0 / 0xAC (current handheld behavior).
+   - **GB / GB Color:** separate from GBA; likely **filename-only** or small header stub in a later iteration (§6).
 
-- **Must implement:** Multi-root or multi-pair scanning; **NDS header path** when ROM is `.nds` (mirror `bridge/game_id.py`: title `0x00–0x0B`, code `0x0C–0x0F`).
-- **Must define:** How **`game_id`** namespaces GBA vs DS if the same stem exists twice (unlikely if paths differ; possible if user duplicates names — see §3.3).
+4. Sanitize and join title/code like Python (`title-code` if code present).
 
-### 2.4 Twilight Menu
+### 3.3 Collisions
 
-- Affects **paths on SD**, not the wire protocol. Plan should reference **documented TM layouts** (nds-bootstrap `saves` folder next to ROMs vs centralized `saves` under `nds`) and let users set resolved paths in config.
-- **No** special-case code for “Twilight” brand string — only path + extension rules.
+- Same **stem** in GBA and NDS (`foo.sav` / `foo.gba` vs `foo.nds`) are **different ROMs** — system from save root disambiguates.
+- Same stem **within** one system: user error or duplicate ROMs — **document** uniqueness; optional **`nds-` prefix** only if we ever need global uniqueness without headers.
 
----
+### 3.4 Single parent + recursive scan (advanced, not default)
 
-## 3. Design options (choose before coding)
-
-### 3.1 Per-system save + ROM dirs (recommended — see §0)
-
-- **Named keys** `gba_save_dir`, `nds_save_dir`, `gb_save_dir` + matching `*_rom_dir` and optional `*_rom_extension` — **no** comma-separated `save_dirs=` list required for clarity.
-- **Scan:** union of all `*.sav` under each **set** save dir (non-recursive vs recursive — **decision:** TM often uses flat `saves/`; default **non-recursive** per root, optional `save_scan_recursive=true` later).
-- **Baseline / status / id-map:** **Recommendation:** **one** `.gbasync-baseline` (and status/id-map) **per** `*_save_dir` root, or a **single** merged baseline keyed by full path — pick one in Phase A.
-
-### 3.2 `game_id` resolution with explicit system
-
-- For each discovered `.sav`, **system** is known from which `*_save_dir` contained it (or from longest-prefix match if paths overlap — avoid overlap in config).
-- Resolve: `stem` + `nds_rom_dir` / `gba_rom_dir` / `gb_rom_dir` + extension → **NDS / GBA / GB** header parsing or stem slug.
-- **Collision:** If the same stem exists in two ROM dirs (user error), **system** from save path disambiguates.
-
-### 3.3 `game_id` collisions
-
-- If **`pokemon-diamond.sav`** and different systems share stems, **filename-only** IDs collide.
-- **Mitigation options:**
-  - **Prefix by system:** `nds-pokemon-diamond` vs `pokemon-emer-bpee` (only if resolver knows system).
-  - **Rely on ROM header** once NDS parsing exists — retail codes differ (`NTR-xxx`).
-  - **Document:** “unique save filenames across systems” as soft requirement if using filename-only mode.
-
-### 3.4 Single parent `save_dir` (alternative)
-
-- e.g. `save_dir=sdmc:/roms` with **recursive** scan for `*.sav`.
-- **Risk:** picks up unintended `.sav` files; deeper TM folders may include duplicates.
-- **Verdict:** possible as **advanced** option; not the default recommendation.
+- One `save_dir` + `**/*.sav` risks picking up stray files; only as power-user option after §3.1 works.
 
 ---
 
-## 4. Implementation phases (proposed)
+## 4. Implementation phases
 
-### Phase A — Design + config spec (no device code)
+### Phase A — Spec freeze (docs + decisions, minimal code)
 
-1. Freeze **INI schema** per §0 (`*_save_dir` / `*_rom_dir` / optional `*_rom_extension`); **no** legacy `save_dir`/`rom_dir` requirement.
-2. Document **Twilight Menu** example paths in **`docs/USER_GUIDE.md`** (when implemented).
-3. List **test matrix:** GBA only, NDS only, mixed, filename-only, ROM header for both.
+1. Lock **INI keys** (§1) and **3DS `mode=vc` migration story** (fold into `gba_*` vs keep separate key).
+2. Choose **baseline strategy** (§3.1 A vs B).
+3. **`docs/USER_GUIDE.md`:** Twilight Menu path examples; collision caveats; “NDS requires matching ROM path.”
+4. **Test matrix** (manual): GBA-only, NDS-only, mixed, header miss → stem fallback, Delta DS spot-check (no GBA trim).
+
+**Exit criteria:** a reviewer can implement Phase B without reopening schema debates.
 
 ### Phase B — Handheld: scan + resolve
 
-1. **3DS + Switch:** Parse new config; build **union** of local save files with **full path** or **(root, relative)** for each entry.
-2. **`resolve_game_id(save_path, cfg)`:**  
-   - Infer **system** from which `*_save_dir` the file lives under.  
-   - Look up ROM in the matching `*_rom_dir` with the right extension → **NDS / GBA / GB** header (or stem fallback).
-3. **Baseline / id-map:** extend to support multiple roots (per-root files or unified format with path keys — **implementer choice from Phase A**).
-4. **Memory / UI:** save viewer lists **all** merged ids; ensure 3DS stack limits still safe (heap patterns as history code).
+1. **3DS + Switch:** parse new config; build union of local saves with **(absolute path, originating root, system enum)**.
+2. Implement **`resolve_game_id_for_save`** dispatch by system + extension (share sanitization with existing `sanitize_game_id`).
+3. **Baseline / id-map:** multi-root per Phase A decision.
+4. **UI / memory:** save viewer and sync loops iterate merged list; watch **3DS** `MAX_SAVES` and heap usage.
 
 ### Phase C — Bridge + Delta
 
-1. Confirm **`rom_dirs`** in bridge configs include **both** `roms/gb` and `roms/nds` with extensions **`[".gba", ".nds"]`** (or separate maps).
-2. **Delta:** validate DS **Harmony** `files[0].size` vs server blob; **no** GBA 131088 trim for DS; add **logging** on size mismatch only.
-3. **Slot / title mapping:** extend regression tests for at least one retail DS title in Dropbox export.
+1. **Bridge configs:** `rom_dirs` + `rom_extensions` include **`.nds`** alongside **`.gba`** where users store DS ROMs (already supported in Python — validate end-to-end).
+2. **Delta / Harmony:** per-game size checks for DS; **no** 131088→131072 trim unless proven identical to a GBA edge case (unlikely).
+3. **Tests:** at least one retail `.nds` in Dropbox export regression path.
 
 ### Phase D — Docs + release
 
-1. **`docs/USER_GUIDE.md`**, **`3ds-client/README.md`**, **`switch-client/README.md`**: unified GBA+NDS, TM paths, collision caveats.
-2. **Version bump** + release scripts for both consoles.
-3. **Optional:** admin UI column “size” / hint for non-GBA (cosmetic).
+1. Client READMEs + USER_GUIDE unified workflow.
+2. Version bump + release scripts.
+3. **Optional:** admin column or badge for “system” metadata if we add `platform` to index later.
 
 ---
 
@@ -135,40 +134,44 @@ Per-platform pairs (omit unused systems):
 
 | Risk | Mitigation |
 |------|------------|
-| Wrong `game_id` if header parsing fails | Strong fallback to stem; optional **manual id map** file later. |
-| Large DS saves / slow hash | Already SHA-256 whole file; acceptable; watch 3DS memory for huge lists. |
-| Delta conflicts | Same as GBA — document **Cloud** resolution after sync. |
-| **3DSi / DSiWare / CIA** | **Out of scope** unless ROM file is a standard `.nds` extract. |
+| Wrong `game_id` if header missing | Stem fallback (today’s behavior); optional manual map file later. |
+| Large DS saves | SHA-256 whole file as today; monitor 3DS list sizes. |
+| Delta conflicts | Same as GBA — user resolves in Delta after sync. |
 
-**Non-goals for first ship:** 3DS **VC DSi** special cases, Switch **standalone DS emulators** other than user-pointed paths, **RetroArch** multi-dir unless covered by generic multi-root.
+**Out of scope (first ship):** DSiWare / **CIA**-only titles without a loose `.nds`, **RetroArch**-specific layouts unless covered by generic roots, Switch emulators beyond user-configured paths.
 
 ---
 
 ## 6. Open questions (resolve in Phase A)
 
-1. **GB / GB Color:** header parsing vs filename-only for `gb_save_dir` (different from GBA).
-2. **Baseline file location:** one file per `*_save_dir` vs single merged baseline with path keys.
-3. **Recursive scan:** default off or on under each `*_save_dir`.
-4. **Switch:** multiple emulator output paths — list all as separate logical `*_save_dir` entries or allow two GBA paths (e.g. `gba_save_dir_2`) if needed later.
+1. **GB / GBC:** header-based id vs filename-only; different cartridge format from GBA.
+2. **Baseline:** one file per save root vs merged file (§3.1).
+3. **Recursive scan:** default **off** per root unless we see a TM layout that requires it everywhere.
+4. **Multiple GBA paths on Switch** (e.g. mGBA + another emu): second `gba_save_dir` vs `gba_save_dir_2` — only if users demand before ship.
+5. **3DS VC mode:** map `vc_save_dir` to `gba_save_dir` when still GBA VC, or keep explicit `vc_*` until unified schema lands.
 
 ---
 
-## 7. References (code anchors)
+## 7. Code references (anchors)
 
-- NDS header helper (Python): `bridge/game_id.py` — `game_id_from_nds_bytes`, `game_id_from_rom_bytes`, `_rom_sha1_and_game_id`.
-- GBA-only handheld parsing: `3ds-client/source/main.c` — `game_id_from_rom_header_bytes`, `resolve_game_id_for_save`; `switch-client/source/main.cpp` — `game_id_from_rom_header`, `resolve_game_id_for_save`.
-- GBA trim (Delta only): `bridge/delta_dropbox_sav.py` — `apply_bytes_to_delta` (131088/131072).
+| Topic | Location |
+|-------|----------|
+| NDS + GBA ID (Python) | `bridge/game_id.py` — `game_id_from_nds_bytes`, `game_id_from_gba_bytes`, `game_id_from_rom_bytes`, `_rom_sha1_and_game_id`, `build_rom_sha1_to_game_id` |
+| GBA-only handheld | `switch-client/source/main.cpp` — `game_id_from_rom_header`, `resolve_game_id_for_save`, `read_file_prefix` |
+| GBA-only handheld | `3ds-client/source/main.c` — `game_id_from_rom_header_bytes`, `resolve_game_id_for_save`, `read_rom_header_prefix` |
+| 3DS dual save roots (not multi-system) | `3ds-client/source/main.c` — `active_save_dir`, `mode` / `vc_save_dir` |
+| Delta GBA trim | `bridge/delta_dropbox_sav.py` — `apply_bytes_to_delta` |
 
 ---
 
-## 8. Summary
+## 8. Effort summary
 
-| Workstream | Effort (rough) | Notes |
-|------------|----------------|--------|
-| Config + multi-dir scan | Medium | Touch both clients + docs |
-| NDS header in C/C++ | Low–medium | Mirror Python offsets; test retail ROMs |
-| Baseline / id-map multi-root | Medium | No legacy migration if clean break |
-| Bridge / Delta | Low–medium | Mostly config + DS spot-checks |
-| Server | Low | None required for blob storage |
+| Workstream | Rough size | Notes |
+|------------|------------|--------|
+| Config + multi-dir scan | Medium | Both clients + samples |
+| NDS (and optional GB) header in C/C++ | Low–medium | Match Python offsets exactly; unit-style fixtures from real ROM prefixes |
+| Baseline / id-map multi-root | Medium | Tied to Phase A choice |
+| Bridge / Delta | Low–medium | Mostly validation + DS size logging |
+| Server | Low | Blob storage unchanged |
 
-**Bottom line:** Unified GBA+NDS sync is **feasible**; the **required** product work is **multi-directory save scanning** + **NDS-aware ROM header resolution** (or strict filename-only with documented uniqueness). **Switching config is not required** once those pieces exist.
+**Bottom line:** Feasible. The **must-have** client work is **multi-root scanning** + **NDS-aware ROM identification** aligned with `bridge/game_id.py`. After that, one config can cover GBA + NDS without swapping profiles.

@@ -39,5 +39,24 @@ rom_extension=.gba
 
 Mode notes:
 
-- `mode=normal`: sync from `save_dir`
-- `mode=vc`: sync from `vc_save_dir` (useful with exported VC save flows)
+- `mode=normal`: sync from `save_dir` **or** from multi-root `gba_*` / `nds_*` / `gb_*` keys (see below)
+- `mode=vc`: sync from `vc_save_dir` only (GBA VC / Checkpoint-style layout); **`[rom]`** still identifies ROM headers. Multi-root keys are **not** used in VC mode.
+
+### GBA + NDS (`mode=normal` only)
+
+If **any** of `gba_save_dir`, `nds_save_dir`, or `gb_save_dir` is set, the client scans **only** those directories. Legacy `save_dir` is ignored in that case.
+
+```ini
+[sync]
+mode=normal
+gba_save_dir=sdmc:/roms/gba/saves
+nds_save_dir=sdmc:/roms/nds/saves
+
+[rom]
+gba_rom_dir=sdmc:/roms/gba
+gba_rom_extension=.gba
+nds_rom_dir=sdmc:/roms/nds
+nds_rom_extension=.nds
+# Comma-separated list is OK — tried in order (e.g. ``.gb`` then ``.gbc``).
+gb_rom_extension=.gb,.gbc
+```

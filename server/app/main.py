@@ -51,7 +51,7 @@ store = SaveStore(
     history_max_per_game=HISTORY_MAX_PER_GAME,
 )
 
-app = FastAPI(title="GBAsync Server", version="0.1.2")
+app = FastAPI(title="GBAsync Server", version="0.1.8")
 
 _log = logging.getLogger("gbasync")
 _dropbox_sync_timer_lock = threading.Lock()
@@ -131,17 +131,16 @@ def _run_dropbox_bridge_once() -> None:
 
     timeout = int(_env("GBASYNC_DROPBOX_SYNC_TIMEOUT_SECONDS", "600"))
     try:
+        # Do not capture stdout/stderr: bridge scripts print progress with ``print()``;
+        # ``capture_output=True`` hid that from the terminal and we only logged tails on failure.
         r = subprocess.run(
             [sys.executable, str(script_path), "--config", str(cfg_path), "--once"],
             cwd=str(cwd),
             env=env,
-            capture_output=True,
-            text=True,
             timeout=timeout,
         )
         if r.returncode != 0:
-            tail = (r.stderr or r.stdout or "").strip()[-2000:]
-            _log.warning("dropbox sync exit %s: %s", r.returncode, tail or "(no output)")
+            _log.warning("dropbox sync subprocess exited with code %s", r.returncode)
     except subprocess.TimeoutExpired:
         _log.warning("dropbox sync timed out after %ss", timeout)
     except OSError as exc:

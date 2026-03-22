@@ -15,12 +15,12 @@ Produces:
 Command:
 
 ```bash
-./scripts/release-server.sh v0.1.7
+./scripts/release-server.sh v0.1.8
 ```
 
 Artifacts:
 
-- `dist/server/gbasync-server-v0.1.7.tar`
+- `dist/server/gbasync-server-v0.1.8.tar`
 - `dist/server/.env.example`
 - `dist/server/docker-compose.yml`
 
@@ -33,12 +33,12 @@ Produces:
 Command:
 
 ```bash
-./scripts/release-bridge.sh v0.1.7
+./scripts/release-bridge.sh v0.1.8
 ```
 
 Artifact:
 
-- `dist/bridge/gbasync-bridge-v0.1.7.zip`
+- `dist/bridge/gbasync-bridge-v0.1.8.zip`
 
 ## 3) Switch release
 
@@ -51,12 +51,12 @@ Prerequisites:
 Command:
 
 ```bash
-./scripts/release-switch.sh v0.1.7
+./scripts/release-switch.sh v0.1.8
 ```
 
 Artifacts directory:
 
-- `dist/switch/gbasync-switch-v0.1.7/`
+- `dist/switch/gbasync-switch-v0.1.8/`
 
 Expected files (depending on build):
 
@@ -78,12 +78,12 @@ Prerequisites:
 Command:
 
 ```bash
-./scripts/release-3ds.sh v0.1.7
+./scripts/release-3ds.sh v0.1.8
 ```
 
 Artifacts directory:
 
-- `dist/3ds/gbasync-3ds-v0.1.7/`
+- `dist/3ds/gbasync-3ds-v0.1.8/`
 
 Expected files (depending on build):
 

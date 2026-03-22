@@ -22,9 +22,28 @@ typedef struct {
   char sync_mode[16];
   char vc_save_dir[256];
   char rom_dir[256];
-  char rom_extension[16];
+  /** Comma-separated ok, e.g. ``.gb,.gbc`` (tried in order for ROM lookup). */
+  char rom_extension[128];
+  char gba_save_dir[256];
+  char nds_save_dir[256];
+  char gb_save_dir[256];
+  char gba_rom_dir[256];
+  char nds_rom_dir[256];
+  char gb_rom_dir[256];
+  char gba_rom_extension[128];
+  char nds_rom_extension[128];
+  char gb_rom_extension[128];
   char locked_ids[512];
 } AppConfig;
+
+typedef enum { ROOT_GBA = 0, ROOT_NDS = 1, ROOT_GB = 2 } SaveRootKind;
+
+typedef struct {
+  SaveRootKind kind;
+  char save_dir[256];
+  char rom_dir[256];
+  char rom_extension[128];
+} SaveRoot;
 
 typedef struct {
   char game_id[128];
@@ -54,7 +73,7 @@ typedef struct {
   char game_id[128];
 } IdMapRow;
 
-#define MAX_SAVES 256
+#define MAX_SAVES 384
 #define SOC_BUFFERSIZE (0x100000)
 
 typedef enum {
@@ -131,6 +150,9 @@ static void config_init(AppConfig* cfg) {
   copy_cstr(cfg->vc_save_dir, sizeof(cfg->vc_save_dir), "sdmc:/3ds/Checkpoint/saves");
   copy_cstr(cfg->rom_dir, sizeof(cfg->rom_dir), "sdmc:/roms/gba");
   copy_cstr(cfg->rom_extension, sizeof(cfg->rom_extension), ".gba");
+  copy_cstr(cfg->gba_rom_extension, sizeof(cfg->gba_rom_extension), ".gba");
+  copy_cstr(cfg->nds_rom_extension, sizeof(cfg->nds_rom_extension), ".nds");
+  copy_cstr(cfg->gb_rom_extension, sizeof(cfg->gb_rom_extension), ".gb");
   cfg->locked_ids[0] = '\0';
 }
 
@@ -178,6 +200,12 @@ static void load_config(AppConfig* cfg, const char* path) {
       copy_cstr(cfg->sync_mode, sizeof(cfg->sync_mode), value);
     } else if (strcmp(section, "sync") == 0 && strcmp(key, "save_dir") == 0) {
       copy_cstr(cfg->save_dir, sizeof(cfg->save_dir), value);
+    } else if (strcmp(section, "sync") == 0 && strcmp(key, "gba_save_dir") == 0) {
+      copy_cstr(cfg->gba_save_dir, sizeof(cfg->gba_save_dir), value);
+    } else if (strcmp(section, "sync") == 0 && strcmp(key, "nds_save_dir") == 0) {
+      copy_cstr(cfg->nds_save_dir, sizeof(cfg->nds_save_dir), value);
+    } else if (strcmp(section, "sync") == 0 && strcmp(key, "gb_save_dir") == 0) {
+      copy_cstr(cfg->gb_save_dir, sizeof(cfg->gb_save_dir), value);
     } else if (strcmp(section, "sync") == 0 && strcmp(key, "vc_save_dir") == 0) {
       copy_cstr(cfg->vc_save_dir, sizeof(cfg->vc_save_dir), value);
     } else if (strcmp(section, "rom") == 0 && strcmp(key, "rom_dir") == 0) {
@@ -191,6 +219,18 @@ static void load_config(AppConfig* cfg, const char* path) {
       }
     } else if (strcmp(section, "rom") == 0 && strcmp(key, "rom_extension") == 0) {
       copy_cstr(cfg->rom_extension, sizeof(cfg->rom_extension), value);
+    } else if (strcmp(section, "rom") == 0 && strcmp(key, "gba_rom_dir") == 0) {
+      copy_cstr(cfg->gba_rom_dir, sizeof(cfg->gba_rom_dir), value);
+    } else if (strcmp(section, "rom") == 0 && strcmp(key, "nds_rom_dir") == 0) {
+      copy_cstr(cfg->nds_rom_dir, sizeof(cfg->nds_rom_dir), value);
+    } else if (strcmp(section, "rom") == 0 && strcmp(key, "gb_rom_dir") == 0) {
+      copy_cstr(cfg->gb_rom_dir, sizeof(cfg->gb_rom_dir), value);
+    } else if (strcmp(section, "rom") == 0 && strcmp(key, "gba_rom_extension") == 0) {
+      copy_cstr(cfg->gba_rom_extension, sizeof(cfg->gba_rom_extension), value);
+    } else if (strcmp(section, "rom") == 0 && strcmp(key, "nds_rom_extension") == 0) {
+      copy_cstr(cfg->nds_rom_extension, sizeof(cfg->nds_rom_extension), value);
+    } else if (strcmp(section, "rom") == 0 && strcmp(key, "gb_rom_extension") == 0) {
+      copy_cstr(cfg->gb_rom_extension, sizeof(cfg->gb_rom_extension), value);
     } else if (strcmp(section, "sync") == 0 && strcmp(key, "locked_ids") == 0) {
       copy_cstr(cfg->locked_ids, sizeof(cfg->locked_ids), value);
     }
@@ -209,8 +249,88 @@ static bool is_vc_mode(const AppConfig* cfg) {
   return strcasecmp(cfg->sync_mode, "vc") == 0;
 }
 
-static const char* active_save_dir(const AppConfig* cfg) {
-  return is_vc_mode(cfg) ? cfg->vc_save_dir : cfg->save_dir;
+static void strip_trailing_slashes_buf(char* s) {
+  if (!s) return;
+  size_t n = strlen(s);
+  while (n > 0 && (s[n - 1] == '/' || s[n - 1] == '\\')) {
+    s[n - 1] = '\0';
+    n--;
+  }
+}
+
+static int build_save_roots(const AppConfig* cfg, SaveRoot* out, int max_out) {
+  if (is_vc_mode(cfg)) {
+    if (max_out < 1) return 0;
+    out[0].kind = ROOT_GBA;
+    copy_cstr(out[0].save_dir, sizeof(out[0].save_dir), cfg->vc_save_dir);
+    copy_cstr(out[0].rom_dir, sizeof(out[0].rom_dir), cfg->rom_dir);
+    copy_cstr(out[0].rom_extension, sizeof(out[0].rom_extension), cfg->rom_extension);
+    strip_trailing_slashes_buf(out[0].save_dir);
+    strip_trailing_slashes_buf(out[0].rom_dir);
+    return 1;
+  }
+  const int multi = (cfg->gba_save_dir[0] || cfg->nds_save_dir[0] || cfg->gb_save_dir[0]);
+  int n = 0;
+  if (multi) {
+    if (cfg->gba_save_dir[0] && n < max_out) {
+      out[n].kind = ROOT_GBA;
+      copy_cstr(out[n].save_dir, sizeof(out[n].save_dir), cfg->gba_save_dir);
+      copy_cstr(out[n].rom_dir, sizeof(out[n].rom_dir), cfg->gba_rom_dir);
+      copy_cstr(out[n].rom_extension, sizeof(out[n].rom_extension),
+                cfg->gba_rom_extension[0] ? cfg->gba_rom_extension : ".gba");
+      strip_trailing_slashes_buf(out[n].save_dir);
+      strip_trailing_slashes_buf(out[n].rom_dir);
+      n++;
+    }
+    if (cfg->nds_save_dir[0] && n < max_out) {
+      out[n].kind = ROOT_NDS;
+      copy_cstr(out[n].save_dir, sizeof(out[n].save_dir), cfg->nds_save_dir);
+      copy_cstr(out[n].rom_dir, sizeof(out[n].rom_dir), cfg->nds_rom_dir);
+      copy_cstr(out[n].rom_extension, sizeof(out[n].rom_extension),
+                cfg->nds_rom_extension[0] ? cfg->nds_rom_extension : ".nds");
+      strip_trailing_slashes_buf(out[n].save_dir);
+      strip_trailing_slashes_buf(out[n].rom_dir);
+      n++;
+    }
+    if (cfg->gb_save_dir[0] && n < max_out) {
+      out[n].kind = ROOT_GB;
+      copy_cstr(out[n].save_dir, sizeof(out[n].save_dir), cfg->gb_save_dir);
+      copy_cstr(out[n].rom_dir, sizeof(out[n].rom_dir), cfg->gb_rom_dir);
+      copy_cstr(out[n].rom_extension, sizeof(out[n].rom_extension),
+                cfg->gb_rom_extension[0] ? cfg->gb_rom_extension : ".gb");
+      strip_trailing_slashes_buf(out[n].save_dir);
+      strip_trailing_slashes_buf(out[n].rom_dir);
+      n++;
+    }
+    if (n == 0 && max_out >= 1) {
+      out[0].kind = ROOT_GBA;
+      copy_cstr(out[0].save_dir, sizeof(out[0].save_dir), cfg->save_dir);
+      copy_cstr(out[0].rom_dir, sizeof(out[0].rom_dir), cfg->rom_dir);
+      copy_cstr(out[0].rom_extension, sizeof(out[0].rom_extension), cfg->rom_extension);
+      strip_trailing_slashes_buf(out[0].save_dir);
+      strip_trailing_slashes_buf(out[0].rom_dir);
+      return 1;
+    }
+    return n;
+  }
+  if (n < max_out) {
+    out[n].kind = ROOT_GBA;
+    copy_cstr(out[n].save_dir, sizeof(out[n].save_dir), cfg->save_dir);
+    copy_cstr(out[n].rom_dir, sizeof(out[n].rom_dir), cfg->rom_dir);
+    copy_cstr(out[n].rom_extension, sizeof(out[n].rom_extension), cfg->rom_extension);
+    strip_trailing_slashes_buf(out[n].save_dir);
+    strip_trailing_slashes_buf(out[n].rom_dir);
+    n++;
+  }
+  return n;
+}
+
+static void ensure_save_roots_exist(const AppConfig* cfg) {
+  SaveRoot roots[8];
+  int nr = build_save_roots(cfg, roots, 8);
+  for (int i = 0; i < nr; i++) {
+    ensure_directory_exists(roots[i].save_dir);
+  }
 }
 
 static void sanitize_game_id(const char* in, char* out, size_t out_size) {
@@ -274,7 +394,7 @@ static void decode_header_field(const unsigned char* src, size_t len, char* out,
   out[j] = '\0';
 }
 
-static bool game_id_from_rom_header_bytes(const unsigned char* data, size_t len, char* out, size_t out_size) {
+static bool game_id_from_gba_rom_header_bytes(const unsigned char* data, size_t len, char* out, size_t out_size) {
   if (!data || len < 0xB0) return false;
   char title[32] = {0};
   char code[8] = {0};
@@ -293,33 +413,97 @@ static bool game_id_from_rom_header_bytes(const unsigned char* data, size_t len,
   return out[0] != '\0';
 }
 
-/* Header fields used for game_id are within the first ~0xB0 bytes; avoid reading multi‑MiB ROMs per .sav. */
-static bool read_rom_header_prefix(const char* path, unsigned char* out, size_t out_sz) {
-  if (out_sz < 0xB0) return false;
-  FILE* fp = fopen(path, "rb");
-  if (!fp) return false;
-  size_t n = fread(out, 1, out_sz, fp);
-  fclose(fp);
-  return n >= 0xB0;
+/* NDS cartridge header @ 0x00 title (12), 0x0C game code (4) — mirror bridge/game_id.py */
+static bool game_id_from_nds_rom_header_bytes(const unsigned char* data, size_t len, char* out, size_t out_size) {
+  if (!data || len < 0x10) return false;
+  char title[32] = {0};
+  char code[8] = {0};
+  char combined[64] = {0};
+  decode_header_field(data + 0x00, 12, title, sizeof(title));
+  decode_header_field(data + 0x0C, 4, code, sizeof(code));
+  trim_line(title);
+  trim_line(code);
+  if (title[0] == '\0' && code[0] == '\0') return false;
+  if (code[0] == '\0') {
+    copy_cstr(combined, sizeof(combined), title);
+  } else {
+    snprintf(combined, sizeof(combined), "%s-%s", title, code);
+  }
+  sanitize_game_id(combined, out, out_size);
+  return out[0] != '\0';
 }
 
-static void resolve_game_id_for_save(const AppConfig* cfg, const char* save_stem, char* out, size_t out_size) {
-  if (cfg->rom_dir[0] != '\0') {
-    char ext[16];
-    copy_cstr(ext, sizeof(ext), cfg->rom_extension[0] ? cfg->rom_extension : ".gba");
-    if (ext[0] != '.') {
-      char tmp[16] = {0};
-      tmp[0] = '.';
-      copy_cstr(tmp + 1, sizeof(tmp) - 1, ext);
-      copy_cstr(ext, sizeof(ext), tmp);
-    }
-    char rom_path[640];
-    snprintf(rom_path, sizeof(rom_path), "%s/%s%s", cfg->rom_dir, save_stem, ext);
-    unsigned char rom_hdr[512];
-    if (read_rom_header_prefix(rom_path, rom_hdr, sizeof(rom_hdr))) {
-      if (game_id_from_rom_header_bytes(rom_hdr, sizeof(rom_hdr), out, out_size)) return;
-    }
+static size_t read_rom_prefix(const char* path, unsigned char* out, size_t out_sz) {
+  FILE* fp = fopen(path, "rb");
+  if (!fp) return 0;
+  size_t n = fread(out, 1, out_sz, fp);
+  fclose(fp);
+  return n;
+}
+
+static const char* default_rom_ext_for_kind(SaveRootKind k) {
+  switch (k) {
+    case ROOT_GBA:
+      return ".gba";
+    case ROOT_NDS:
+      return ".nds";
+    case ROOT_GB:
+      return ".gb";
   }
+  return ".gba";
+}
+
+/** Normalize one comma-separated extension token into ``out`` (leading dot). */
+static void normalize_rom_ext_token(char* tok, char* out, size_t out_sz) {
+  while (*tok == ' ' || *tok == '\t') tok++;
+  size_t len = strlen(tok);
+  while (len > 0 && (tok[len - 1] == ' ' || tok[len - 1] == '\t')) {
+    tok[len - 1] = '\0';
+    len--;
+  }
+  if (!tok[0]) {
+    out[0] = '\0';
+    return;
+  }
+  if (tok[0] != '.') {
+    snprintf(out, out_sz, ".%s", tok);
+  } else {
+    copy_cstr(out, out_sz, tok);
+  }
+}
+
+static void resolve_game_id_for_save_root(const SaveRoot* root, const char* save_stem, char* out, size_t out_size) {
+  if (!root->rom_dir[0]) {
+    sanitize_game_id(save_stem, out, out_size);
+    return;
+  }
+  char list_buf[256];
+  if (root->rom_extension[0]) {
+    copy_cstr(list_buf, sizeof(list_buf), root->rom_extension);
+  } else {
+    copy_cstr(list_buf, sizeof(list_buf), default_rom_ext_for_kind(root->kind));
+  }
+  char work[256];
+  copy_cstr(work, sizeof(work), list_buf);
+  char* saveptr = NULL;
+  char* token = strtok_r(work, ",", &saveptr);
+  while (token) {
+    char ext[32];
+    normalize_rom_ext_token(token, ext, sizeof(ext));
+    if (ext[0] != '\0') {
+      char rom_path[640];
+      snprintf(rom_path, sizeof(rom_path), "%s/%s%s", root->rom_dir, save_stem, ext);
+      unsigned char rom_hdr[512];
+      const size_t got = read_rom_prefix(rom_path, rom_hdr, sizeof(rom_hdr));
+      if (root->kind == ROOT_NDS) {
+        if (got >= 0x10 && game_id_from_nds_rom_header_bytes(rom_hdr, got, out, out_size)) return;
+      } else if (root->kind == ROOT_GBA) {
+        if (got >= 0xB0 && game_id_from_gba_rom_header_bytes(rom_hdr, got, out, out_size)) return;
+      }
+    }
+    token = strtok_r(NULL, ",", &saveptr);
+  }
+  /* GB / fallback: stem only */
   sanitize_game_id(save_stem, out, out_size);
 }
 
@@ -571,6 +755,106 @@ static void baseline_upsert(BaselineRow* rows, int* n, int max_n, const char* ga
     copy_cstr(rows[*n].game_id, sizeof(rows[*n].game_id), game_id);
     copy_cstr(rows[*n].sha256, sizeof(rows[*n].sha256), sha256);
     (*n)++;
+  }
+}
+
+static int baseline_load_merged(const AppConfig* cfg, BaselineRow* rows, int max_rows) {
+  SaveRoot roots[8];
+  const int nr = build_save_roots(cfg, roots, 8);
+  BaselineRow* tmp = (BaselineRow*)calloc((size_t)MAX_SAVES, sizeof(BaselineRow));
+  if (!tmp) return 0;
+  int n = 0;
+  for (int i = 0; i < nr; i++) {
+    const int m = baseline_load(roots[i].save_dir, tmp, MAX_SAVES);
+    for (int j = 0; j < m; j++) {
+      baseline_upsert(rows, &n, max_rows, tmp[j].game_id, tmp[j].sha256);
+    }
+  }
+  free(tmp);
+  return n;
+}
+
+static const char* pick_baseline_root_for_game(
+    const AppConfig* cfg,
+    const char* game_id,
+    LocalSave* locals,
+    int n_local) {
+  static char out_buf[256];
+  SaveRoot roots[8];
+  const int nr = build_save_roots(cfg, roots, 8);
+  if (nr <= 0) {
+    out_buf[0] = '\0';
+    return out_buf;
+  }
+  for (int i = 0; i < n_local; i++) {
+    if (strcmp(locals[i].game_id, game_id) != 0) continue;
+    const char* best = roots[0].save_dir;
+    size_t best_len = 0;
+    for (int j = 0; j < nr; j++) {
+      char r[256];
+      copy_cstr(r, sizeof(r), roots[j].save_dir);
+      strip_trailing_slashes_buf(r);
+      const size_t plen = strlen(r);
+      if (plen > best_len && strncmp(locals[i].path, r, plen) == 0 &&
+          (locals[i].path[plen] == '\0' || locals[i].path[plen] == '/')) {
+        best = roots[j].save_dir;
+        best_len = plen;
+      }
+    }
+    copy_cstr(out_buf, sizeof(out_buf), best);
+    return out_buf;
+  }
+  copy_cstr(out_buf, sizeof(out_buf), roots[0].save_dir);
+  return out_buf;
+}
+
+static int save_dir_cmp(const char* a, const char* b) {
+  char x[256];
+  char y[256];
+  copy_cstr(x, sizeof(x), a);
+  copy_cstr(y, sizeof(y), b);
+  strip_trailing_slashes_buf(x);
+  strip_trailing_slashes_buf(y);
+  return strcmp(x, y);
+}
+
+static bool baseline_save_merged(
+    const AppConfig* cfg,
+    BaselineRow* rows,
+    int n,
+    LocalSave* locals,
+    int n_local) {
+  SaveRoot roots[8];
+  const int nr = build_save_roots(cfg, roots, 8);
+  if (nr <= 0) return false;
+  BaselineRow* subset = (BaselineRow*)calloc((size_t)MAX_SAVES, sizeof(BaselineRow));
+  if (!subset) return false;
+  bool ok = true;
+  for (int i = 0; i < nr; i++) {
+    int ns = 0;
+    for (int j = 0; j < n; j++) {
+      const char* want = pick_baseline_root_for_game(cfg, rows[j].game_id, locals, n_local);
+      if (save_dir_cmp(want, roots[i].save_dir) == 0) {
+        baseline_upsert(subset, &ns, MAX_SAVES, rows[j].game_id, rows[j].sha256);
+      }
+    }
+    if (ns > 0) {
+      if (!baseline_save(roots[i].save_dir, subset, ns)) ok = false;
+    }
+    ns = 0;
+    memset(subset, 0, (size_t)MAX_SAVES * sizeof(BaselineRow));
+  }
+  free(subset);
+  return ok;
+}
+
+static void first_save_dir_for_status(const AppConfig* cfg, char* out, size_t out_sz) {
+  SaveRoot roots[8];
+  const int nr = build_save_roots(cfg, roots, 8);
+  if (nr > 0) {
+    copy_cstr(out, out_sz, roots[0].save_dir);
+  } else {
+    copy_cstr(out, out_sz, cfg->save_dir);
   }
 }
 
@@ -1392,8 +1676,9 @@ static void save_history_picker_3ds(AppConfig* cfg, const char* game_id) {
   free(rows);
 }
 
-static bool local_game_id_exists(LocalSave* local, int local_count, const char* game_id) {
-  for (int i = 0; i < local_count; i++) {
+static bool local_game_id_exists_in_dir(
+    LocalSave* local, int dir_start, int dir_end, const char* game_id) {
+  for (int i = dir_start; i < dir_end; i++) {
     if (strcmp(local[i].game_id, game_id) == 0) return true;
   }
   return false;
@@ -1403,7 +1688,13 @@ static int cmp_name_rows(const void* a, const void* b) {
   return strcmp((const char*)a, (const char*)b);
 }
 
-static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* out, int max_items) {
+static int scan_local_saves(
+    const SaveRoot* root,
+    const char* dir,
+    LocalSave* out,
+    int start_offset,
+    int max_items) {
+  if (start_offset >= max_items) return 0;
   DIR* d = opendir(dir);
   if (!d) {
     printf("ERROR: cannot open save_dir: %s (errno=%d)\n", dir, errno);
@@ -1425,7 +1716,7 @@ static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* ou
     return 0;
   }
   int n_sav_names = 0;
-  int count = 0;
+  int count = start_offset;
   int sav_candidates = 0;
   int read_failures = 0;
   int stat_failures = 0;
@@ -1454,10 +1745,10 @@ static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* ou
     if (map_idx >= 0 && id_map[map_idx].game_id[0] != '\0') {
       copy_cstr(item.game_id, sizeof(item.game_id), id_map[map_idx].game_id);
     } else {
-      resolve_game_id_for_save(cfg, stem, item.game_id, sizeof(item.game_id));
+      resolve_game_id_for_save_root(root, stem, item.game_id, sizeof(item.game_id));
     }
-    if (local_game_id_exists(out, count, item.game_id)) {
-      // Ensure unique IDs per local save even when ROM headers collide.
+    if (local_game_id_exists_in_dir(out, start_offset, count, item.game_id)) {
+      /* Same directory only — do not treat IDs from other save roots as collisions. */
       char base_id[128];
       sanitize_game_id(stem, base_id, sizeof(base_id));
       if (base_id[0] == '\0') copy_cstr(base_id, sizeof(base_id), "unknown-game");
@@ -1465,7 +1756,7 @@ static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* ou
       copy_cstr(base_short, sizeof(base_short), base_id);
       copy_cstr(item.game_id, sizeof(item.game_id), base_short);
       int suffix = 2;
-      while (local_game_id_exists(out, count, item.game_id) && suffix < 1000) {
+      while (local_game_id_exists_in_dir(out, start_offset, count, item.game_id) && suffix < 1000) {
         snprintf(item.game_id, sizeof(item.game_id), "%s-%d", base_short, suffix++);
       }
     }
@@ -1500,7 +1791,7 @@ static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* ou
   free(id_map);
   if (sav_candidates == 0) {
     printf("No .sav files found in %s\n", dir);
-  } else if (count == 0) {
+  } else if (count == start_offset) {
     printf(
         "No usable .sav files in %s (%d seen; stat_fail=%d read_fail=%d)\n",
         dir,
@@ -1508,7 +1799,17 @@ static int scan_local_saves(const AppConfig* cfg, const char* dir, LocalSave* ou
         stat_failures,
         read_failures);
   }
-  return count;
+  return count - start_offset;
+}
+
+static int scan_all_local_saves(const AppConfig* cfg, LocalSave* out, int max_items) {
+  SaveRoot roots[8];
+  const int nr = build_save_roots(cfg, roots, 8);
+  int total = 0;
+  for (int i = 0; i < nr && total < max_items; i++) {
+    total += scan_local_saves(&roots[i], roots[i].save_dir, out, total, max_items);
+  }
+  return total;
 }
 
 static LocalSave* find_local_by_id(LocalSave* locals, int n, const char* id) {
@@ -1567,18 +1868,21 @@ static bool put_one_save(
     const AppConfig* cfg,
     const LocalSave* l,
     bool force,
-    const char* source_tag) {
+    const char* source_tag,
+    char* out_uploaded_sha65) {
   unsigned char* bytes = NULL;
   size_t len = 0;
   if (!read_file_bytes(l->path, &bytes, &len)) {
     printf("%s: ERROR(read)\n", l->game_id);
     return false;
   }
+  char computed_sha[65];
+  sha256_hash(bytes, len, computed_sha);
   char ts_q[80], hash_q[80], filename_q[400], clk_q[80], path[1200];
   char ts_wall[40];
   mtime_to_utc_iso(time(NULL), ts_wall, sizeof(ts_wall));
   url_encode_simple(ts_wall, ts_q, sizeof(ts_q));
-  url_encode_simple(l->sha256, hash_q, sizeof(hash_q));
+  url_encode_simple(computed_sha, hash_q, sizeof(hash_q));
   url_encode_simple(l->name, filename_q, sizeof(filename_q));
   url_encode_simple(ts_wall, clk_q, sizeof(clk_q));
   const char* force_q = force ? "&force=1" : "";
@@ -1589,7 +1893,7 @@ static bool put_one_save(
       l->game_id,
       ts_q,
       hash_q,
-      l->size_bytes,
+      len,
       filename_q,
       source_tag,
       clk_q,
@@ -1616,14 +1920,16 @@ static bool put_one_save(
   if (json_body_applied_is_true(put_resp, put_len)) {
     free(put_resp);
     printf("%s: UPLOADED\n", l->game_id);
+    if (out_uploaded_sha65) memcpy(out_uploaded_sha65, computed_sha, 65);
     return true;
   }
   if (!json_body_has_applied_member(put_resp, put_len)) {
     free(put_resp);
     printf("%s: UPLOADED\n", l->game_id);
+    if (out_uploaded_sha65) memcpy(out_uploaded_sha65, computed_sha, 65);
     return true;
   }
-  if (!verify_server_has_sha(cfg, l->game_id, put_resp, put_len, l->sha256)) {
+  if (!verify_server_has_sha(cfg, l->game_id, put_resp, put_len, computed_sha)) {
     free(put_resp);
     printf(
         "%s: REJECTED (could not confirm save on server — check URL/API key / response truncated)\n",
@@ -1632,11 +1938,82 @@ static bool put_one_save(
   }
   free(put_resp);
   printf("%s: UPLOADED\n", l->game_id);
+  if (out_uploaded_sha65) memcpy(out_uploaded_sha65, computed_sha, 65);
   return true;
 }
 
+static void pick_download_dir_3ds(
+    const AppConfig* cfg,
+    const char* game_id,
+    const RemoteSave* r,
+    LocalSave* locals,
+    int n_local,
+    char* out_dir,
+    size_t out_dir_sz) {
+  for (int i = 0; i < n_local; i++) {
+    if (strcmp(locals[i].game_id, game_id) == 0) {
+      const char* p = locals[i].path;
+      const char* slash = strrchr(p, '/');
+      if (slash && (size_t)(slash - p) + 1 < out_dir_sz) {
+        memcpy(out_dir, p, (size_t)(slash - p));
+        out_dir[slash - p] = '\0';
+        return;
+      }
+    }
+  }
+  char filename[256];
+  char fallback_name[160];
+  snprintf(fallback_name, sizeof(fallback_name), "%.127s.sav", game_id);
+  if (r->filename_hint[0] != '\0') {
+    sanitize_filename(filename, sizeof(filename), r->filename_hint, fallback_name);
+  } else {
+    sanitize_filename(filename, sizeof(filename), fallback_name, fallback_name);
+  }
+  char stem[256];
+  copy_cstr(stem, sizeof(stem), filename);
+  char* dot = strrchr(stem, '.');
+  if (dot) *dot = '\0';
+  SaveRoot roots[8];
+  const int nr = build_save_roots(cfg, roots, 8);
+  for (int i = 0; i < nr; i++) {
+    if (roots[i].rom_dir[0] == '\0') continue;
+    char list_buf[256];
+    if (roots[i].rom_extension[0]) {
+      copy_cstr(list_buf, sizeof(list_buf), roots[i].rom_extension);
+    } else {
+      copy_cstr(list_buf, sizeof(list_buf), default_rom_ext_for_kind(roots[i].kind));
+    }
+    char work[256];
+    copy_cstr(work, sizeof(work), list_buf);
+    char* saveptr = NULL;
+    char* token = strtok_r(work, ",", &saveptr);
+    while (token) {
+      char ext[32];
+      normalize_rom_ext_token(token, ext, sizeof(ext));
+      if (ext[0] != '\0') {
+        char rom_path[700];
+        snprintf(rom_path, sizeof(rom_path), "%s/%s%s", roots[i].rom_dir, stem, ext);
+        FILE* f = fopen(rom_path, "rb");
+        if (f) {
+          fclose(f);
+          copy_cstr(out_dir, out_dir_sz, roots[i].save_dir);
+          return;
+        }
+      }
+      token = strtok_r(NULL, ",", &saveptr);
+    }
+  }
+  copy_cstr(out_dir, out_dir_sz, nr > 0 ? roots[0].save_dir : "");
+}
+
 static bool get_one_save(
-    const AppConfig* cfg, const char* save_dir, const char* game_id, const RemoteSave* r) {
+    const AppConfig* cfg,
+    const char* game_id,
+    const RemoteSave* r,
+    LocalSave* locals,
+    int n_local) {
+  char dest[256];
+  pick_download_dir_3ds(cfg, game_id, r, locals, n_local, dest, sizeof(dest));
   char filename[256];
   char fallback_name[160];
   snprintf(fallback_name, sizeof(fallback_name), "%.127s.sav", game_id);
@@ -1646,7 +2023,7 @@ static bool get_one_save(
     sanitize_filename(filename, sizeof(filename), fallback_name, fallback_name);
   }
   char out_path[512];
-  join_path(out_path, sizeof(out_path), save_dir, filename);
+  join_path(out_path, sizeof(out_path), dest, filename);
 
   char get_path[256];
   snprintf(get_path, sizeof(get_path), "/save/%.127s", game_id);
@@ -1671,11 +2048,12 @@ static bool get_one_save(
 /* Both local and server differ from baseline — wait for X/Y instead of finishing sync with SKIP. */
 static void resolve_both_changed_conflict(
     const AppConfig* cfg,
-    const char* save_dir,
     const char* source_tag,
     LocalSave* l,
     RemoteSave* r,
     const char* id,
+    LocalSave* locals,
+    int n_local,
     BaselineRow* baseline,
     int* n_baseline,
     SyncSummary* summary) {
@@ -1694,14 +2072,15 @@ static void resolve_both_changed_conflict(
     hidScanInput();
     u32 kDown = hidKeysDown();
     if (kDown & KEY_X) {
-      if (put_one_save(cfg, l, true, source_tag)) {
-        baseline_upsert(baseline, n_baseline, MAX_SAVES, id, l->sha256);
+      char uploaded_sha[65];
+      if (put_one_save(cfg, l, true, source_tag, uploaded_sha)) {
+        baseline_upsert(baseline, n_baseline, MAX_SAVES, id, uploaded_sha);
         if (summary) summary->uploads++;
       }
       break;
     }
     if (kDown & KEY_Y) {
-      if (get_one_save(cfg, save_dir, id, r)) {
+      if (get_one_save(cfg, id, r, locals, n_local)) {
         baseline_upsert(baseline, n_baseline, MAX_SAVES, id, r->sha256);
         if (summary) summary->downloads++;
       }
@@ -1717,11 +2096,10 @@ static void resolve_both_changed_conflict(
 }
 
 static bool pick_upload_selection_3ds(const AppConfig* cfg, SyncManualFilter* out) {
-  const char* save_dir = active_save_dir(cfg);
   LocalSave* local = (LocalSave*)calloc(MAX_SAVES, sizeof(LocalSave));
   if (!local) return false;
-  ensure_directory_exists(save_dir);
-  int n = scan_local_saves(cfg, save_dir, local, MAX_SAVES);
+  ensure_save_roots_exist(cfg);
+  int n = scan_all_local_saves(cfg, local, MAX_SAVES);
   if (n <= 0) {
     printf("No local .sav files to upload.\n");
     free(local);
@@ -2100,7 +2478,6 @@ static int cmp_merge_id_str(const void* a, const void* b) {
 }
 
 static void save_viewer_3ds(AppConfig* cfg) {
-  const char* save_dir = active_save_dir(cfg);
   LocalSave* local = (LocalSave*)calloc(MAX_SAVES, sizeof(LocalSave));
   RemoteSave* remote = (RemoteSave*)calloc(MAX_SAVES, sizeof(RemoteSave));
   if (!local || !remote) {
@@ -2108,8 +2485,8 @@ static void save_viewer_3ds(AppConfig* cfg) {
     free(remote);
     return;
   }
-  ensure_directory_exists(save_dir);
-  int lc = scan_local_saves(cfg, save_dir, local, MAX_SAVES);
+  ensure_save_roots_exist(cfg);
+  int lc = scan_all_local_saves(cfg, local, MAX_SAVES);
   int status = 0;
   unsigned char* body = NULL;
   size_t body_len = 0;
@@ -2345,7 +2722,8 @@ static void sync_status_save(
 }
 
 static void sync_status_after_server(const AppConfig* cfg, int last_ok, int server_ok, const char* err) {
-  const char* sd = active_save_dir(cfg);
+  char sd[256];
+  first_save_dir_for_status(cfg, sd, sizeof(sd));
   time_t now = time(NULL);
   int db = -1;
   char path[512];
@@ -2364,12 +2742,14 @@ static void sync_status_after_server(const AppConfig* cfg, int last_ok, int serv
 }
 
 static void sync_status_after_dropbox(const AppConfig* cfg, int http_ok) {
-  const char* sd = active_save_dir(cfg);
+  char sd[256];
+  first_save_dir_for_status(cfg, sd, sizeof(sd));
   sync_status_save(sd, time(NULL), http_ok, http_ok, http_ok ? 1 : 0, "");
 }
 
 static void sync_status_print_menu(const AppConfig* cfg) {
-  const char* sd = active_save_dir(cfg);
+  char sd[256];
+  first_save_dir_for_status(cfg, sd, sizeof(sd));
   char path[512];
   gbasync_status_path(path, sizeof(path), sd);
   FILE* fp = fopen(path, "r");
@@ -2528,9 +2908,8 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
     free(remote);
     return summary;
   }
-  const char* save_dir = active_save_dir(cfg);
   const char* source_tag = is_vc_mode(cfg) ? "3ds-homebrew-vc" : "3ds-homebrew";
-  ensure_directory_exists(save_dir);
+  ensure_save_roots_exist(cfg);
   BaselineRow* baseline = (BaselineRow*)calloc((size_t)MAX_SAVES, sizeof(BaselineRow));
   if (!baseline) {
     printf("ERROR: out of memory (baseline buffer)\n");
@@ -2538,8 +2917,8 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
     free(remote);
     return summary;
   }
-  int n_baseline = baseline_load(save_dir, baseline, MAX_SAVES);
-  int local_count = scan_local_saves(cfg, save_dir, local, MAX_SAVES);
+  int n_baseline = baseline_load_merged(cfg, baseline, MAX_SAVES);
+  int local_count = scan_all_local_saves(cfg, local, MAX_SAVES);
   printf("Local saves: %d\n", local_count);
 
   int status = 0;
@@ -2561,12 +2940,13 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
   if (action == SYNC_ACTION_UPLOAD_ONLY) {
     for (int i = 0; i < local_count; i++) {
       if (!id_in_manual(xy_filter, local[i].game_id)) continue;
-      if (put_one_save(cfg, &local[i], true, source_tag)) {
-        baseline_upsert(baseline, &n_baseline, MAX_SAVES, local[i].game_id, local[i].sha256);
+      char uploaded_sha[65];
+      if (put_one_save(cfg, &local[i], true, source_tag, uploaded_sha)) {
+        baseline_upsert(baseline, &n_baseline, MAX_SAVES, local[i].game_id, uploaded_sha);
         summary.uploads++;
       }
     }
-    if (!baseline_save(save_dir, baseline, n_baseline)) {
+    if (!baseline_save_merged(cfg, baseline, n_baseline, local, local_count)) {
       printf("WARN: could not write .gbasync-baseline\n");
     }
     sync_status_after_server(cfg, 1, 1, "");
@@ -2579,12 +2959,13 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
   if (action == SYNC_ACTION_DOWNLOAD_ONLY) {
     for (int i = 0; i < remote_count; i++) {
       if (!id_in_manual(xy_filter, remote[i].game_id)) continue;
-      if (get_one_save(cfg, save_dir, remote[i].game_id, &remote[i])) {
+      if (get_one_save(cfg, remote[i].game_id, &remote[i], local, local_count)) {
         baseline_upsert(baseline, &n_baseline, MAX_SAVES, remote[i].game_id, remote[i].sha256);
         summary.downloads++;
       }
     }
-    if (!baseline_save(save_dir, baseline, n_baseline)) {
+    local_count = scan_all_local_saves(cfg, local, MAX_SAVES);
+    if (!baseline_save_merged(cfg, baseline, n_baseline, local, local_count)) {
       printf("WARN: could not write .gbasync-baseline\n");
     }
     sync_status_after_server(cfg, 1, 1, "");
@@ -2668,7 +3049,7 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
           }
         }
       }
-      if (!baseline_save(save_dir, baseline, n_baseline)) {
+      if (!baseline_save_merged(cfg, baseline, n_baseline, local, local_count)) {
         printf("WARN: could not write .gbasync-baseline\n");
       }
       sync_status_after_server(cfg, 1, 1, "");
@@ -2729,32 +3110,35 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
       const int loc_eq = (strcmp(l->sha256, base) == 0);
       const int rem_eq = (strcmp(r->sha256, base) == 0);
       if (loc_eq && !rem_eq) {
-        if (get_one_save(cfg, save_dir, id, r)) {
+        if (get_one_save(cfg, id, r, local, local_count)) {
           baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, r->sha256);
           summary.downloads++;
         }
       } else if (!loc_eq && rem_eq) {
-        if (put_one_save(cfg, l, false, source_tag)) {
-          baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, l->sha256);
+        char uploaded_sha[65];
+        if (put_one_save(cfg, l, false, source_tag, uploaded_sha)) {
+          baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, uploaded_sha);
           summary.uploads++;
         }
       } else if (!loc_eq && !rem_eq) {
-        resolve_both_changed_conflict(cfg, save_dir, source_tag, l, r, id, baseline, &n_baseline, &summary);
+        resolve_both_changed_conflict(cfg, source_tag, l, r, id, local, local_count, baseline, &n_baseline, &summary);
       }
     } else if (l && !r) {
-      if (put_one_save(cfg, l, false, source_tag)) {
-        baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, l->sha256);
+      char uploaded_sha[65];
+      if (put_one_save(cfg, l, false, source_tag, uploaded_sha)) {
+        baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, uploaded_sha);
         summary.uploads++;
       }
     } else if (!l && r) {
-      if (get_one_save(cfg, save_dir, id, r)) {
+      if (get_one_save(cfg, id, r, local, local_count)) {
         baseline_upsert(baseline, &n_baseline, MAX_SAVES, id, r->sha256);
         summary.downloads++;
       }
     }
   }
 
-  if (!baseline_save(save_dir, baseline, n_baseline)) {
+  local_count = scan_all_local_saves(cfg, local, MAX_SAVES);
+  if (!baseline_save_merged(cfg, baseline, n_baseline, local, local_count)) {
     printf("WARN: could not write .gbasync-baseline\n");
   }
   sync_status_after_server(cfg, 1, 1, "");
@@ -2884,7 +3268,19 @@ int main(int argc, char** argv) {
       printf("------------------\n");
       printf("Server: %s\n", cfg.server_url);
       printf("Mode: %s\n", is_vc_mode(&cfg) ? "vc" : "normal");
-      printf("Save dir: %s\n\n", active_save_dir(&cfg));
+      if (is_vc_mode(&cfg)) {
+        printf("Save dir: %s\n\n", cfg.vc_save_dir);
+      } else {
+        SaveRoot roots[8];
+        const int nr = build_save_roots(&cfg, roots, 8);
+        if (nr <= 1) {
+          printf("Save dir: %s\n\n", nr > 0 ? roots[0].save_dir : cfg.save_dir);
+        } else {
+          printf("Save dirs:");
+          for (int i = 0; i < nr; i++) printf(" %s", roots[i].save_dir);
+          printf("\n\n");
+        }
+      }
       sync_status_print_menu(&cfg);
       /* Two columns: sync actions (left) | R / SELECT / START hints (right) */
       {
