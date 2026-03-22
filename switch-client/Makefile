@@ -19,7 +19,7 @@ LIBS := -lnx
 
 APP_TITLE := GBAsync
 APP_AUTHOR := drippyday
-APP_VERSION := 0.1.6
+APP_VERSION := 0.1.7
 ICON_SRC := ../icons/switch_icon_256x256-2.jpg
 
 OBJ := $(BUILD)/main.o
