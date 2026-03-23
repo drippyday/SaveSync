@@ -405,9 +405,8 @@ To improve cross-device matching accuracy, set in bridge config:
 
 ### `dist/server`
 
-- `gbasync-server-vX.Y.Z.tar`: Docker image archive for the server.
-- `docker-compose.yml`: Compose file to run server container.
-- `README.txt`: quick load/run instructions for that packaged image.
+- **`gbasync-server-vX.Y.Z.zip`**: Contains **`gbasync-server-vX.Y.Z/`** with the Docker **`.tar`**, **`docker-compose.yml`**, **`.env`**, **`.env.example`**, and **`README.md`** (install / volumes).
+- **`gbasync-server-vX.Y.Z.tar`**: Docker image archive (inside the folder above).
 
 ### `dist/bridge`
 
@@ -425,13 +424,17 @@ To improve cross-device matching accuracy, set in bridge config:
 
 ### `dist/switch`
 
+- **`gbasync-switch-vX.Y.Z.zip`**: Same layout as the **`gbasync-switch-vX.Y.Z/`** folder.
 - `gbasync.nro`: runnable Switch homebrew app (what users launch).
 - `gbasync.nacp`: app metadata (title/author/version), consumed by tooling.
 - `gbasync.elf`: raw executable/debug build artifact (not typically copied to SD for normal use).
-- `INSTALL.txt`: end-user install instructions.
+- **`README.md`**: install steps at package root.
+- **`gba-sync/config.ini`**: template config (path on SD: **`sdmc:/switch/gba-sync/config.ini`**).
+- **`gba-sync/README.md`**: every **`config.ini`** key for Switch.
 
 ### `dist/3ds`
 
+- **`gbasync-3ds-vX.Y.Z.zip`**: Same layout as **`gbasync-3ds-vX.Y.Z/`**.
 - `gbasync.3dsx`: runnable 3DS homebrew app (what users launch).
 - `gbasync.smdh`: icon/metadata asset used by Homebrew Launcher.
-- `INSTALL.txt`: end-user install instructions.
+- **`README.md`**, **`gba-sync/config.ini`**, **`gba-sync/README.md`** (config path: **`sdmc:/3ds/gba-sync/config.ini`**).

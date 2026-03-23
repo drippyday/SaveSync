@@ -14,7 +14,7 @@ Nintendo **Switch** homebrew app that syncs **`.sav`** files with a **GBAsync se
 
 ## Setup (install and configure)
 
-1. **Get a build** from **`dist/switch`** (or build from source — **`docs/RELEASE.md`**).
+1. **Get a build** from **`dist/switch`** (or build from source — **`docs/RELEASE.md`**). Release zips include **`README.md`** and **`gba-sync/README.md`** (every **`config.ini`** key); the same text lives under **`switch-client/distribution/`** in the repo.
 2. **Copy to SD card:**
    - **`gbasync.nro`** → **`sdmc:/switch/gbasync.nro`**
 3. **Create config:**

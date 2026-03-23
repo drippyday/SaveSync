@@ -8,9 +8,11 @@ For end-user setup and operation instructions, see `docs/USER_GUIDE.md`.
 
 Produces:
 
-- Docker image tarball
-- `.env.example` (repository root; server + Dropbox template)
-- `docker-compose.yml`
+- **`dist/server/gbasync-server-<ver>.zip`** containing **`gbasync-server-<ver>/`** with:
+  - Docker image tarball
+  - `.env.example` / `.env` (template + copy)
+  - `docker-compose.yml`
+  - **`README.md`** (install / paths)
 
 Command:
 
@@ -20,9 +22,8 @@ Command:
 
 Artifacts (replace `v1.0.0` with your tag):
 
-- `dist/server/gbasync-server-v1.0.0.tar`
-- `dist/server/.env.example`
-- `dist/server/docker-compose.yml`
+- `dist/server/gbasync-server-v1.0.0.zip`
+- `dist/server/gbasync-server-v1.0.0/` (unpacked tree; same contents as the zip)
 
 ## 2) Bridge release
 
@@ -54,11 +55,10 @@ Command:
 ./scripts/release-switch.sh v1.0.0
 ```
 
-Artifacts directory:
+Artifacts:
 
-- `dist/switch/gbasync-switch-v1.0.0/`
-
-Expected files (depending on build):
+- `dist/switch/gbasync-switch-v1.0.0.zip`
+- `dist/switch/gbasync-switch-v1.0.0/` — **`README.md`**, **`gba-sync/config.ini`**, **`gba-sync/README.md`**, plus:
 
 - `*.nro`
 - `*.nacp`
@@ -81,11 +81,10 @@ Command:
 ./scripts/release-3ds.sh v1.0.0
 ```
 
-Artifacts directory:
+Artifacts:
 
-- `dist/3ds/gbasync-3ds-v1.0.0/`
-
-Expected files (depending on build):
+- `dist/3ds/gbasync-3ds-v1.0.0.zip`
+- `dist/3ds/gbasync-3ds-v1.0.0/` — **`README.md`**, **`gba-sync/`** as above, plus:
 
 - `*.3dsx`
 - `*.cia` (if configured)

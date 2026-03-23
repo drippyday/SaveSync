@@ -7,6 +7,8 @@ DIST_DIR="$ROOT_DIR/dist/switch"
 VERSION="${1:-dev}"
 OUT_DIR="$DIST_DIR/gbasync-switch-${VERSION}"
 
+rm -rf "$OUT_DIR"
+
 if [[ -z "${DEVKITPRO:-}" ]]; then
   if [[ -d "/opt/devkitpro" ]]; then
     export DEVKITPRO="/opt/devkitpro"
@@ -28,67 +30,16 @@ for artifact in "$SWITCH_DIR"/*.nro "$SWITCH_DIR"/*.nacp "$SWITCH_DIR"/*.elf; do
   fi
 done
 
-cat > "$OUT_DIR/INSTALL.txt" <<EOF
-GBAsync Switch Client - Install Guide
-=====================================
+cp "$SWITCH_DIR/distribution/README.md" "$OUT_DIR/README.md"
+cp "$SWITCH_DIR/distribution/gba-sync/README.md" "$OUT_DIR/gba-sync/README.md"
+cp "$SWITCH_DIR/distribution/gba-sync/config.ini" "$OUT_DIR/gba-sync/config.ini"
 
-Artifact:
-- gbasync.nro
-- gbasync.nacp
-- gbasync.elf
+(
+  cd "$DIST_DIR"
+  rm -f "gbasync-switch-${VERSION}.zip"
+  zip -qr "gbasync-switch-${VERSION}.zip" "gbasync-switch-${VERSION}"
+)
 
-Copy to SD:
-- gbasync.nro -> sdmc:/switch/gbasync.nro
-- copy gba-sync/config.ini -> sdmc:/switch/gba-sync/config.ini
-
-config.ini example:
-
-[server]
-url=http://10.0.0.151:8080
-api_key=change-me
-
-[sync]
-save_dir=sdmc:/mGBA
-
-[rom]
-rom_dir=sdmc:/mGBA
-rom_extension=.gba
-
-Run:
-1) Launch Homebrew Menu
-2) Start gbasync
-3) A = Auto sync (SHA-256 + baseline; preview then apply; may upload some, download others)
-4) X = upload-only: confirm, then checkboxes (ALL SAVES or each game), + = OK, B = cancel
-5) Y = download-only: same pick list, then downloads selected games
-6) - = trigger Dropbox sync-once on server
-7) Press + to exit
-
-Expected log examples:
-- Auto sync: after preview confirm, per-game lines only (e.g. pokemon-emerald: UPLOADED).
-- Upload/download modes: Local saves: N / Remote saves: M may appear, then per-game results.
-
-Troubleshooting:
-- config path must be sdmc:/switch/gba-sync/config.ini
-- use http:// URL for this MVP
-- ensure API key matches server
-
-What each artifact is:
-- gbasync.nro: app you run from Homebrew Menu
-- gbasync.nacp: metadata file (title/author/version)
-- gbasync.elf: raw executable/debug artifact (not usually copied to SD)
-EOF
-
-cat > "$OUT_DIR/gba-sync/config.ini" <<EOF
-[server]
-url=http://10.0.0.151:8080
-api_key=change-me
-
-[sync]
-save_dir=sdmc:/mGBA
-
-[rom]
-rom_dir=sdmc:/mGBA
-rom_extension=.gba
-EOF
-
-echo "Switch release artifacts created in: $OUT_DIR"
+echo "Switch release artifacts:"
+echo "  $OUT_DIR/"
+echo "  $DIST_DIR/gbasync-switch-${VERSION}.zip"

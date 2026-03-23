@@ -188,10 +188,10 @@ Not exhaustive—see **`.env.example`** and **`docs/USER_GUIDE.md`**.
 
 Typical outputs (exact names match the tag):
 
-- **`dist/server/gbasync-server-v1.0.0.tar`** — Docker image (includes **`admin-web/`**).
+- **`dist/server/gbasync-server-v1.0.0.zip`** — contains **`gbasync-server-v1.0.0/`** with **`gbasync-server-v1.0.0.tar`** (Docker image, includes **`admin-web/`**), **`docker-compose.yml`**, **`.env`**, **`README.md`**.
 - **`dist/bridge/gbasync-bridge-v1.0.0.zip`**
-- **`dist/switch/gbasync-switch-v1.0.0/`** — `gbasync.nro`, `.nacp`, `INSTALL.txt`, sample `gba-sync/config.ini`
-- **`dist/3ds/gbasync-3ds-v1.0.0/`** — `gbasync.3dsx`, optional `.cia`, `INSTALL.txt`, sample config
+- **`dist/switch/gbasync-switch-v1.0.0.zip`** (and unpacked folder) — `gbasync.nro`, `.nacp`, **`README.md`**, **`gba-sync/config.ini`**, **`gba-sync/README.md`**
+- **`dist/3ds/gbasync-3ds-v1.0.0.zip`** — `gbasync.3dsx`, optional `.cia`, same **`README.md`** / **`gba-sync/`** layout
 
 Set **`APP_VERSION`** in **`switch-client/Makefile`** to match the release tag so **`.nacp`** metadata matches the package.
 

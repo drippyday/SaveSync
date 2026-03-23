@@ -14,7 +14,7 @@ Nintendo **3DS** homebrew app that syncs **`.sav`** files with a **GBAsync serve
 
 ## Setup (install and configure)
 
-1. **Get a build** from **`dist/3ds`** (or build from source — **`docs/RELEASE.md`**).
+1. **Get a build** from **`dist/3ds`** (or build from source — **`docs/RELEASE.md`**). Release zips include **`README.md`** and **`gba-sync/README.md`** (full **`config.ini`** reference); see **`3ds-client/distribution/`** in the repo.
 2. **Copy to SD card:**
    - **`gbasync.3dsx`** → **`sdmc:/3ds/gbasync.3dsx`**
    - Optional: install **`gbasync.cia`** with FBI if your release includes it.

@@ -55,7 +55,7 @@ curl http://127.0.0.1:8080/health
 
 **2. Install the console builds**
 
-Prebuilt artifacts are described in **`dist/README.md`**. Each console zip includes an **`INSTALL.txt`**. Configure **`gba-sync/config.ini`** with your server URL and API key.
+Prebuilt artifacts are described in **`dist/README.md`**. Each console **zip** includes **`README.md`** and **`gba-sync/README.md`** (full **`config.ini`** reference); edit **`gba-sync/config.ini`** with your server URL and API key.
 
 **3. Optional — Delta / Dropbox**
 

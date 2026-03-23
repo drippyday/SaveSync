@@ -2,25 +2,27 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SERVER_DIR="$ROOT_DIR/server"
 DIST_DIR="$ROOT_DIR/dist/server"
 VERSION="${1:-dev}"
+PKG_DIR="$DIST_DIR/gbasync-server-${VERSION}"
 IMAGE_TAG="gbasync-server:${VERSION}"
 
-mkdir -p "$DIST_DIR"
+rm -rf "$PKG_DIR"
+mkdir -p "$PKG_DIR"
 
 echo "Building Docker image: $IMAGE_TAG"
 docker build -f "$ROOT_DIR/server/Dockerfile" -t "$IMAGE_TAG" "$ROOT_DIR"
 
 echo "Saving image tarball..."
-docker save "$IMAGE_TAG" -o "$DIST_DIR/gbasync-server-${VERSION}.tar"
+docker save "$IMAGE_TAG" -o "$PKG_DIR/gbasync-server-${VERSION}.tar"
 
-cp "$ROOT_DIR/.env.example" "$DIST_DIR/.env.example"
-# Starter env so `docker compose up` works without a manual cp (edit API_KEY before real use).
-cp "$DIST_DIR/.env.example" "$DIST_DIR/.env"
+cp "$ROOT_DIR/.env.example" "$PKG_DIR/.env.example"
+cp "$PKG_DIR/.env.example" "$PKG_DIR/.env"
+
+cp "$ROOT_DIR/server/distribution/README.md" "$PKG_DIR/README.md"
 
 # Dist bundle has no Dockerfile — compose must use the pre-built image from the tarball.
-cat > "$DIST_DIR/docker-compose.yml" <<EOF
+cat > "$PKG_DIR/docker-compose.yml" <<EOF
 services:
   gbasync-server:
     image: $IMAGE_TAG
@@ -38,32 +40,12 @@ services:
     restart: unless-stopped
 EOF
 
-cat > "$DIST_DIR/README.txt" <<EOF
-GBAsync Server Release
-======================
+(
+  cd "$DIST_DIR"
+  rm -f "gbasync-server-${VERSION}.zip"
+  zip -qr "gbasync-server-${VERSION}.zip" "gbasync-server-${VERSION}"
+)
 
-Image tag: $IMAGE_TAG
-Tarball: gbasync-server-${VERSION}.tar
-
-Load image:
-  docker load -i gbasync-server-${VERSION}.tar
-
-Run compose (no build — image is already loaded):
-  docker compose up -d
-
-(Release copies .env.example → .env for you. To reset: cp -f .env.example .env)
-
-Develop / rebuild from source (requires repo checkout):
-  cd /path/to/GBAsync/server
-  docker compose build --no-cache && docker compose up -d
-
-The image can run Dropbox sync in-process: set SAVESYNC_DROPBOX_MODE and Dropbox vars in the same .env as the server (see repo USER_GUIDE.md).
-
-Host storage:
-- Inside the full GBAsync repo, dist/server/docker-compose.yml mounts ../../save_data
-  (repository-root save_data/, same as development from server/).
-- If you copied only this folder elsewhere, edit docker-compose.yml and set the volume to
-  ./save_data:/data so data stays next to this directory.
-EOF
-
-echo "Server release artifacts created in: $DIST_DIR"
+echo "Server release artifacts:"
+echo "  $PKG_DIR/"
+echo "  $DIST_DIR/gbasync-server-${VERSION}.zip"

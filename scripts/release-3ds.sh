@@ -7,6 +7,8 @@ DIST_DIR="$ROOT_DIR/dist/3ds"
 VERSION="${1:-dev}"
 OUT_DIR="$DIST_DIR/gbasync-3ds-${VERSION}"
 
+rm -rf "$OUT_DIR"
+
 if [[ "$VERSION" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
   major="${BASH_REMATCH[1]}"
   minor="${BASH_REMATCH[2]}"
@@ -47,76 +49,16 @@ for artifact in "$THREEDS_DIR"/*.3dsx "$THREEDS_DIR"/*.cia "$THREEDS_DIR"/*.smdh
   fi
 done
 
-cat > "$OUT_DIR/INSTALL.txt" <<EOF
-GBAsync 3DS Client - Install Guide
-==================================
+cp "$THREEDS_DIR/distribution/README.md" "$OUT_DIR/README.md"
+cp "$THREEDS_DIR/distribution/gba-sync/README.md" "$OUT_DIR/gba-sync/README.md"
+cp "$THREEDS_DIR/distribution/gba-sync/config.ini" "$OUT_DIR/gba-sync/config.ini"
 
-Artifacts:
-- gbasync.3dsx
-- gbasync.cia
-- gbasync.smdh
+(
+  cd "$DIST_DIR"
+  rm -f "gbasync-3ds-${VERSION}.zip"
+  zip -qr "gbasync-3ds-${VERSION}.zip" "gbasync-3ds-${VERSION}"
+)
 
-Copy to SD:
-- gbasync.3dsx -> sdmc:/3ds/gbasync.3dsx
-- install gbasync.cia with FBI (optional, for HOME Menu launch)
-- copy gba-sync/config.ini -> sdmc:/3ds/gba-sync/config.ini
-
-config.ini example:
-
-[server]
-url=http://10.0.0.151:8080
-api_key=change-me
-
-[sync]
-mode=normal
-save_dir=sdmc:/3ds/open_agb_firm/saves/
-# when mode=vc, app uses vc_save_dir instead of save_dir
-vc_save_dir=sdmc:/3ds/Checkpoint/saves
-
-[rom]
-rom_dir=sdmc:/roms/gba
-rom_extension=.gba
-
-Run:
-1) Launch Homebrew Launcher
-2) Start gbasync
-3) A = Auto sync (SHA-256 + baseline; preview then apply; may upload some, download others)
-4) X = upload-only: confirm, pick saves; START or R or X to run, B = cancel
-5) Y = download-only: pick saves; START or R or Y to run, B = cancel
-6) SELECT = trigger Dropbox sync-once on server
-7) Press START to exit
-
-Expected status example:
-- Scanning local saves...
-- Local saves: 2
-- Remote saves: 3
-- pokemon-emerald: DOWNLOADED
-
-Troubleshooting:
-- config path must be sdmc:/3ds/gba-sync/config.ini
-- use http:// URL for this MVP
-- ensure API key and server IP are correct
-
-What each artifact is:
-- gbasync.3dsx: app you run from Homebrew Launcher
-- gbasync.cia: installable package for HOME Menu launch
-- gbasync.smdh: icon and metadata displayed by launcher
-EOF
-
-cat > "$OUT_DIR/gba-sync/config.ini" <<EOF
-[server]
-url=http://10.0.0.151:8080
-api_key=change-me
-
-[sync]
-mode=normal
-save_dir=sdmc:/3ds/open_agb_firm/saves/
-# when mode=vc, app uses vc_save_dir instead of save_dir
-vc_save_dir=sdmc:/3ds/Checkpoint/saves
-
-[rom]
-rom_dir=sdmc:/roms/gba
-rom_extension=.gba
-EOF
-
-echo "3DS release artifacts created in: $OUT_DIR"
+echo "3DS release artifacts:"
+echo "  $OUT_DIR/"
+echo "  $DIST_DIR/gbasync-3ds-${VERSION}.zip"
