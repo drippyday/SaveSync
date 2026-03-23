@@ -7,6 +7,8 @@ This guide explains how to run GBAsync end-to-end across:
 - Nintendo Switch homebrew client
 - Nintendo 3DS homebrew client
 
+**Repository-root `.env`:** Every variable supported by **`.env.example`** is documented in **[§2 Environment variables](#2-environment-variables-repository-root-env)** (grouped by area: core API, admin, Dropbox auth, sidecar timing, `plain` vs `delta_api`).
+
 ## 1) Start the server
 
 ### Option A: Docker (recommended)
@@ -29,13 +31,7 @@ List or restore with **`GET /save/{game_id}/history`** and **`POST /save/{game_i
 
 **Display names:** Optional **`display_name`** in the index (set in admin with **Display name**, or **`PATCH /save/{game_id}/meta`**). Returned in **`GET /saves`**. On **Switch** and **3DS** **save viewer** (main menu **R**), the primary line shows **`display_name`** when set, and falls back to **`game_id`** — it does **not** change the canonical **`game_id`** or routing.
 
-**Dropbox in the same container:** set in your **repository-root** `.env`:
-
-- `GBASYNC_DROPBOX_MODE=off` — default; API only.
-- `GBASYNC_DROPBOX_MODE=delta_api` — runs **`delta_dropbox_api_sync.py`** on an interval (Harmony folder over the Dropbox API). Set `DROPBOX_REMOTE_DELTA_FOLDER`, `DROPBOX_ACCESS_TOKEN`, and **`GBASYNC_ROM_DIRS=/roms`**. By default **`server/docker-compose.yml`** mounts **`${HOME}/Documents/GBA`** on the host to **`/roms`** in the container; change that volume if your ROMs live elsewhere.
-- `GBASYNC_DROPBOX_MODE=plain` — **`dropbox_bridge.py`** for a flat `*.sav` Dropbox folder; set `DROPBOX_REMOTE_FOLDER`.
-
-Tune `GBASYNC_DROPBOX_INTERVAL_SECONDS` (and optional `GBASYNC_BRIDGE_START_DELAY_SECONDS`). For mostly event-driven behavior, enable `GBASYNC_DROPBOX_SYNC_ON_UPLOAD=true`, set `GBASYNC_DROPBOX_SYNC_DEBOUNCE_SECONDS` (default 10), and keep a long interval as fallback. No separate bridge install is required when using Docker.
+**Dropbox in the same container:** configure **`GBASYNC_DROPBOX_MODE`** and related variables in the **repository-root** **`.env`**. Full variable list, defaults, and which credentials apply to **`plain`** vs **`delta_api`** are in **[§2 Environment variables](#2-environment-variables-repository-root-env)**. **`server/docker-compose.yml`** mounts **`${HOME}/Documents/GBA`** → **`/roms`** (read-only) for ROM hashing; override that volume if your ROMs live elsewhere.
 
 Verify:
 
@@ -66,7 +62,86 @@ Expected startup log snippet:
 INFO:     Uvicorn running on http://0.0.0.0:8080
 ```
 
-## 2) Configure and run Delta bridge
+## 2) Environment variables (repository-root .env)
+
+Copy **`/.env.example`** → **`.env`** at the **repository root** (same folder as `README.md`). The server loads this file on startup (`server/app/main.py` uses `load_dotenv` on that path). **Docker Compose** also passes **`env_file: ../.env`** from `server/docker-compose.yml`, so the same file configures the container.
+
+**Legacy names:** Every **`GBASYNC_*`** variable also accepts **`SAVESYNC_*`** with the same meaning (e.g. `GBASYNC_DROPBOX_MODE` or `SAVESYNC_DROPBOX_MODE`). Prefer **`GBASYNC_*`** in new configs.
+
+**Paths:** Values like **`../save_data/...`** are written for running **uvicorn from `server/`** (cwd = `server/`). In **Docker**, `server/docker-compose.yml` **`environment:`** overrides **`SAVE_ROOT`**, **`INDEX_PATH`**, **`HISTORY_ROOT`**, and **`HISTORY_MAX_VERSIONS_PER_GAME`** (see that file), bind-mounts **`../save_data`** → **`/data`**, and still loads the rest of your variables from **`.env`** via **`env_file`**. The **`SAVE_*` / `INDEX_*` paths inside `.env`** therefore apply to **local uvicorn**; in Compose, use the **`environment:`** block for in-container paths.
+
+| Variable | Required | Default / if unset | What it does |
+|----------|----------|--------------------|--------------|
+| **`API_KEY`** | Strongly recommended | — | Shared secret: clients and bridge send **`X-API-Key`** with this value. If **empty or unset**, the server **does not** validate API keys (**open API** — fine only for trusted local testing). |
+| **`SAVE_ROOT`** | Yes | `./data/saves` (code default) | Directory where per-game **`.sav`** blobs are stored. |
+| **`INDEX_PATH`** | Yes | `./data/index.json` | **`GET /saves`** metadata (**`index.json`**), not a full directory scan. |
+| **`HISTORY_ROOT`** | Yes | `./data/history` | Parent folder for per-game version history when enabled. |
+| **`ENABLE_VERSION_HISTORY`** | No | `true` | If **`true`**, each replacement of a save can keep prior blobs under **`HISTORY_ROOT/{game_id}/`**. If **`false`**, history features are off. |
+| **`HISTORY_MAX_VERSIONS_PER_GAME`** | No | `5` | Max backup **files** per game (**`0`** = unlimited). Pinned revisions are not counted toward the cap. |
+| **`SAVE_SYNC_LOG_CLIENT_DEBUG`** | No | off | If **`1`**, **`true`**, or **`yes`**, extra logging when clients **`POST /debug/client-clock`**. |
+
+### Admin web UI
+
+| Variable | Required | Default / if unset | What it does |
+|----------|----------|--------------------|--------------|
+| **`GBASYNC_ADMIN_PASSWORD`** | No | empty | If **non-empty**, **`/admin`** and **`/admin/ui/`** are enabled; if empty, admin routes are **404**. |
+| **`GBASYNC_ADMIN_SECRET`** | No | — | If set, used **only** for signing the admin **session cookie** HMAC. If unset, **`API_KEY`** is used for that HMAC. **`X-API-Key`** for admin APIs still uses **`API_KEY`**. |
+| **`GBASYNC_SLOT_MAP_PATH`** | No | — | Optional filesystem path to a **slot map** JSON file; exposed via **`GET /admin/api/slot-map`** when admin is enabled. Also accepts **`SAVESYNC_SLOT_MAP_PATH`**. |
+
+### Dropbox authentication (only when using Dropbox API scripts)
+
+Configure **one** auth method. Scopes typically include **files.metadata.read** and **content read/write** (see **`bridge/DROPBOX_SETUP.md`**).
+
+| Variable | Required | What it does |
+|----------|----------|--------------|
+| **`DROPBOX_ACCESS_TOKEN`** | One method | Short-lived **user** access token (simplest for testing). |
+| **`DROPBOX_APP_KEY`** | Other method | App key for refresh-token flow. |
+| **`DROPBOX_APP_SECRET`** | Other method | App secret for refresh-token flow. |
+| **`DROPBOX_REFRESH_TOKEN`** | Other method | Long-lived refresh token (typical for servers). If using this trio, you can leave **`DROPBOX_ACCESS_TOKEN`** unset. |
+
+### `GBASYNC_DROPBOX_MODE` and related
+
+| Variable | Required | Default / if unset | What it does |
+|----------|----------|--------------------|--------------|
+| **`GBASYNC_DROPBOX_MODE`** | No | `off` | **`off`** — no Dropbox bridge in the container; API only. **`plain`** — **`dropbox_bridge.py`** syncs a **flat** `*.sav` folder in Dropbox. **`delta_api`** — **`delta_dropbox_api_sync.py`** syncs Delta’s **Harmony** tree via the Dropbox API. |
+| **`GBASYNC_PUBLIC_SERVER_URL`** | When mode ≠ `off` | `http://127.0.0.1:8080` | Base URL written into generated bridge config (**`server_url`**). Must match what your clients use (host/port). |
+
+**Sidecar (Docker entrypoint):** When mode is **`plain`** or **`delta_api`**, the image runs **`write_bridge_config.py`** and **`bridge_sidecar.py`**, which periodically invoke the same scripts as in **`bridge/`**.
+
+| Variable | Required | Default / if unset | What it does |
+|----------|----------|--------------------|--------------|
+| **`GBASYNC_DROPBOX_INTERVAL_SECONDS`** | No | `300` in code; **`86400`** in **`.env.example`** | Seconds **between** scheduled bridge runs (minimum **10** in sidecar). Use a long value if you rely on upload-triggered sync. |
+| **`GBASYNC_BRIDGE_START_DELAY_SECONDS`** | No | `8` | Seconds to wait after container start before the **first** sidecar run. |
+| **`GBASYNC_DROPBOX_SYNC_ON_UPLOAD`** | No | **off** if unset | If **`1`/`true`/`yes`**, after a **`PUT`** stores new bytes the server **debounces** and runs one Dropbox bridge pass. **`.env.example`** sets **`true`** for event-driven sync; omit or set **`false`** to rely on the interval only. |
+| **`GBASYNC_DROPBOX_SYNC_DEBOUNCE_SECONDS`** | No | `10` | Quiet period after the last qualifying **`PUT`** before that upload-triggered run. |
+| **`GBASYNC_DROPBOX_SYNC_TIMEOUT_SECONDS`** | No | `600` | Max seconds for each bridge **subprocess** run (upload-triggered or manual **`POST /dropbox/sync-once`**). |
+
+**Plain mode only:**
+
+| Variable | Required | What it does |
+|----------|----------|--------------|
+| **`DROPBOX_REMOTE_FOLDER`** | **Yes** for `plain` | Dropbox path to the **flat** `*.sav` folder (leading **`/`**, e.g. **`/GBAsync/gba`**). |
+| **`GBASYNC_DROPBOX_POLL_SECONDS`** | No | If set, overrides **`poll_seconds`** in the generated JSON for **`dropbox_bridge.py`**. If unset, **`write_bridge_config`** uses **`GBASYNC_DROPBOX_INTERVAL_SECONDS`** for **`poll_seconds`**. |
+
+**`delta_api` mode:**
+
+| Variable | Required | Default / if unset | What it does |
+|----------|----------|--------------------|--------------|
+| **`DROPBOX_REMOTE_DELTA_FOLDER`** | **Yes** for `delta_api` | Dropbox path to Delta’s **Harmony** root (e.g. **`/Delta Emulator`**). |
+| **`GBASYNC_ROM_DIRS`** | No | — | Comma-separated **container** paths scanned for ROMs (SHA-1 → **`game_id`**). Docker Compose often mounts host ROMs at **`/roms`** and sets **`GBASYNC_ROM_DIRS=/roms`**. |
+| **`GBASYNC_ROM_EXTENSIONS`** | No | `.gba` in **`.env.example`**; code default **`.gba,.nds`** | Comma-separated list used when matching ROM files. |
+| **`GBASYNC_ROM_MAP_PATH`** | No | — | Optional JSON map from save stems to ROM paths (passed through to generated config). |
+| **`GBASYNC_DELTA_SYNC_MODE`** | No | `server_delta` | **`triple`** or **`server_delta`** — passed to **`delta_dropbox_api_sync.py`** (three-way vs server–Delta merge). |
+| **`GBASYNC_DELTA_SLOT_MAP_PATH`** | No | `/data/delta-slot-map.json` in generated config | Harmony **slot map** path inside the container. |
+| **`GBASYNC_SERVER_DELTA_ONE_WAY`** | No | see below | **`false`** / **`0`** — two-way guardrails (Harmony timestamps can block server→Dropbox). **`true`** / **`1`** — when server and Dropbox bytes differ, prefer pushing server → Delta. If unset or invalid, **`write_bridge_config`** defaults **`server_delta_one_way`** to **`true`** (see **`server/write_bridge_config.py`**). |
+| **`GBASYNC_SERVER_DELTA_MIN_DELTA_WIN_SECONDS`** | No | — | Guardrail: minimum seconds before Delta’s **`modifiedDate`** can “win” in two-way flows (integer ≥ 0). |
+| **`GBASYNC_SERVER_DELTA_RECENT_SERVER_PROTECT_SECONDS`** | No | — | Guardrail: recent server uploads protected for this many seconds (integer ≥ 0). |
+
+For behavior of the merge and first-time conflicts, see **§ Delta two-way behavior** under **[3) Configure and run Delta bridge](#3-configure-and-run-delta-bridge)**.
+
+---
+
+## 3) Configure and run Delta bridge
 
 1. Copy `bridge/config.example.json` to `bridge/config.json`
 2. Set:
@@ -155,11 +230,11 @@ GBASYNC_SERVER_DELTA_RECENT_SERVER_PROTECT_SECONDS=3600
 
 **Save size (mGBA vs Delta):** mGBA on Switch/3DS often produces **131088**-byte GBA flash saves (128 KiB plus a 16-byte footer). Delta’s Harmony slot for the same game is usually **131072** bytes. When the bridge writes **from the GBAsync server into Delta’s Dropbox files**, it **trims those 16 bytes** only in that step so the blob matches Delta’s `files[0].size`. Your server copy is unchanged; see **`bridge/DELTA_DROPBOX_FORMAT.md`** for detail.
 
-## 3) Install Switch client
+## 4) Install Switch client
 
 Use artifact:
 
-- `dist/switch/gbasync-switch-v0.1.8/gbasync.nro`
+- `dist/switch/gbasync-switch-v1.0.0/gbasync.nro`
 
 On SD card:
 
@@ -200,11 +275,11 @@ pokemon-emerald: UPLOADED
 metroid-zero: DOWNLOADED
 ```
 
-## 4) Install 3DS client
+## 5) Install 3DS client
 
 Use artifact:
 
-- `dist/3ds/gbasync-3ds-v0.1.8/gbasync.3dsx`
+- `dist/3ds/gbasync-3ds-v1.0.0/gbasync.3dsx`
 
 On SD card:
 
@@ -263,7 +338,7 @@ Remote saves: 3
 pokemon-emerald: DOWNLOADED
 ```
 
-## 5) Validate cross-device sync
+## 6) Validate cross-device sync
 
 1. Run one client (Delta/Switch/3DS) and make save progress.
 2. On a console with newer progress, press **`A`** (Auto sync): **Switch** and **3DS** both use each game’s save **SHA256** and a small **`.gbasync-baseline`** file next to your `.sav` files (legacy **`.savesync-baseline`** is still supported; unreliable SD modification times are not used for merge decisions on either console). Or use upload-only (`X`) to force-push chosen saves.
@@ -286,7 +361,7 @@ Quick local smoke test (server + bridge only):
 ./scripts/smoke-sync.sh
 ```
 
-## 6) Server index vs files (`index.json`)
+## 7) Server index vs files (`index.json`)
 
 The server’s **`GET /saves`** list is driven by the **metadata index** (default host path **`save_data/index.json`** when using repo Docker layout), not by scanning `save_data/saves/` alone. Uploads (curl, bridge, consoles) **register rows** in that index.
 
@@ -297,7 +372,7 @@ If you **delete local test `.sav` files** or remove blobs on disk but leave the 
 
 See **`server/README.md`** for the `DELETE` curl example.
 
-## 7) Common issues
+## 8) Common issues
 
 - **401 unauthorized**: API key mismatch.
 - **No saves found**: wrong `save_dir`, missing `.sav` files.
@@ -307,7 +382,7 @@ See **`server/README.md`** for the `DELETE` curl example.
 - **“Ghost” saves after tests**: stale **`index.json`** rows — use **`DELETE /save/{game_id}`** or edit the index.
 - **Switch preview screen**: use **A** to run the planned sync; **B** backs out; **+** does not cancel there (avoids accidental backs).
 
-## 8) Game ID normalization
+## 9) Game ID normalization
 
 Bridge game ID resolution order:
 
@@ -320,13 +395,13 @@ To improve cross-device matching accuracy, set in bridge config:
 - `rom_map_path`: optional JSON map `{ "Save File Stem": "/full/path/to/ROM.gba" }`
 - `rom_extensions`: ROM extensions for auto-matching (default `[".gba"]`)
 
-## 9) Current MVP limits
+## 10) Current MVP limits
 
 - Switch/3DS clients use **HTTP** only in this repo path (no TLS).
 - **`game_id`:** ROM header when `[rom]` paths are set on the console config; otherwise normalized save stem (same idea as the bridge).
 - Console sync is manual (app-triggered), not background.
 
-## 10) Dist artifact reference
+## 11) Dist artifact reference
 
 ### `dist/server`
 

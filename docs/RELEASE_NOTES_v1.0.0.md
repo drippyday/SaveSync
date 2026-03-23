@@ -20,7 +20,7 @@ Sync on consoles is **foreground** (you open the app and run a sync). There is *
 
 ### Runtime
 
-- **FastAPI** + **uvicorn**; health at **`GET /health`**.
+- **FastAPI** + **uvicorn**; health at **`GET /health`**. OpenAPI app version **`1.0.0`** (matches this tag).
 - Config via **environment** (see repo-root **`.env.example`**): `API_KEY`, `SAVE_ROOT`, `INDEX_PATH`, `HISTORY_ROOT`, optional history caps, admin password, Dropbox mode, etc.
 - **`gbasync.*` application logging** to stderr so admin uploads and similar **INFO** lines appear in Docker/process logs (not only uvicorn access logs).
 - **Atomic** writes for save blobs; **index-backed** listing (`GET /saves` is **not** a raw directory scan).
