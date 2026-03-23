@@ -4,34 +4,6 @@
 
 ---
 
-## Server, Docker, and the `bridge/` folder (important)
-
-**Most users never install the bridge separately.**
-
-- If you run the **GBAsync server with Docker** (`cd server && docker compose up -d`) and set **`GBASYNC_DROPBOX_MODE`** to something other than `off` in your repo-root **`.env`**, the container already includes the **bridge Python scripts** under `/app/bridge`. The entrypoint runs **`write_bridge_config.py`** and a **sidecar** that periodically executes **`delta_dropbox_api_sync.py`** or **`dropbox_bridge.py`**—the same code as in the **`bridge/`** directory in this repo. **You do not need** to unzip `dist/bridge/…` on another machine for that setup.
-- **You also do not need** the bridge for **Switch ↔ server** or **3DS ↔ server** only. The consoles talk **HTTP** to the server API; no desktop bridge is involved.
-
-**When you *do* need the standalone `bridge/` tree (or `dist/bridge/gbasync-bridge-*.zip`):**
-
-- You want **`bridge.py`** to watch a **local folder** of plain `.sav` files on a **Mac/PC** (no Docker on that machine), and sync that folder with the server.
-- You run **`delta_folder_server_sync.py`** against a **locally synced** Delta Emulator folder (Dropbox desktop app) **outside** Docker.
-- You run **`delta_dropbox_api_sync.py`** or **`dropbox_bridge.py`** **manually** on a host that is **not** the Docker server (e.g. a small always-on box without the GBAsync image).
-
-**Optional web admin** (`admin-web/`) is bundled **inside** the Docker image as static files; no separate install.
-
-See **`bridge/README.md`** for script-by-script detail and **`docs/USER_GUIDE.md`** for Dropbox env vars and Harmony behavior.
-
-### Storing saves on disk (including folders synced by *other* apps)
-
-GBAsync is **not** tied to Dropbox for where files live on your machine:
-
-- The **server** writes blobs under **`SAVE_ROOT`** and metadata under **`INDEX_PATH`** / **`HISTORY_ROOT`**. Those paths are **ordinary directories**. You can **bind-mount** (Docker) or point env vars at a folder that **Syncthing**, **Resilio**, **iCloud Drive**, **NFS**, or any other tool keeps in sync—GBAsync just reads/writes files there; the other app handles replication.
-- If you want a **second** tree of **plain `.sav` files** (for another workflow) that tracks the server, run **`bridge.py`** on a PC/Mac and set **`delta_save_dir`** to a local folder; point that folder at whatever sync tool you use. See **`bridge/README.md`** (“Local copies…”).
-
-**Dropbox-specific** scripts (`delta_dropbox_api_sync.py`, etc.) are only for **Dropbox’s API** or **Harmony** layout—not required for “save to my disk / my sync folder.”
-
----
-
 ## What you get
 
 - **One place for saves** — The server stores each game’s save file and metadata. Your devices sync **to** and **from** that source of truth.
@@ -135,6 +107,34 @@ Replace the tag with your release (e.g. `v1.0.0`). **Toolchain:** Python 3.11+ (
 ## Contributing
 
 See **`docs/TODO.md`** for themes (e.g. HTTPS on consoles, richer admin UI, tests). Background context: **`docs/INITIAL_IDEA.md`**.
+
+---
+
+## Server, Docker, and the `bridge/` folder (important)
+
+**Most users never install the bridge separately.**
+
+- If you run the **GBAsync server with Docker** (`cd server && docker compose up -d`) and set **`GBASYNC_DROPBOX_MODE`** to something other than `off` in your repo-root **`.env`**, the container already includes the **bridge Python scripts** under `/app/bridge`. The entrypoint runs **`write_bridge_config.py`** and a **sidecar** that periodically executes **`delta_dropbox_api_sync.py`** or **`dropbox_bridge.py`**—the same code as in the **`bridge/`** directory in this repo. **You do not need** to unzip `dist/bridge/…` on another machine for that setup.
+- **You also do not need** the bridge for **Switch ↔ server** or **3DS ↔ server** only. The consoles talk **HTTP** to the server API; no desktop bridge is involved.
+
+**When you *do* need the standalone `bridge/` tree (or `dist/bridge/gbasync-bridge-*.zip`):**
+
+- You want **`bridge.py`** to watch a **local folder** of plain `.sav` files on a **Mac/PC** (no Docker on that machine), and sync that folder with the server.
+- You run **`delta_folder_server_sync.py`** against a **locally synced** Delta Emulator folder (Dropbox desktop app) **outside** Docker.
+- You run **`delta_dropbox_api_sync.py`** or **`dropbox_bridge.py`** **manually** on a host that is **not** the Docker server (e.g. a small always-on box without the GBAsync image).
+
+**Optional web admin** (`admin-web/`) is bundled **inside** the Docker image as static files; no separate install.
+
+See **`bridge/README.md`** for script-by-script detail and **`docs/USER_GUIDE.md`** for Dropbox env vars and Harmony behavior.
+
+### Storing saves on disk (including folders synced by *other* apps)
+
+GBAsync is **not** tied to Dropbox for where files live on your machine:
+
+- The **server** writes blobs under **`SAVE_ROOT`** and metadata under **`INDEX_PATH`** / **`HISTORY_ROOT`**. Those paths are **ordinary directories**. You can **bind-mount** (Docker) or point env vars at a folder that **Syncthing**, **Resilio**, **iCloud Drive**, **NFS**, or any other tool keeps in sync—GBAsync just reads/writes files there; the other app handles replication.
+- If you want a **second** tree of **plain `.sav` files** (for another workflow) that tracks the server, run **`bridge.py`** on a PC/Mac and set **`delta_save_dir`** to a local folder; point that folder at whatever sync tool you use. See **`bridge/README.md`** (“Local copies…”).
+
+**Dropbox-specific** scripts (`delta_dropbox_api_sync.py`, etc.) are only for **Dropbox’s API** or **Harmony** layout—not required for “save to my disk / my sync folder.”
 
 ---
 
