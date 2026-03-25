@@ -42,6 +42,7 @@ HISTORY_ROOT = Path(os.getenv("HISTORY_ROOT", "./data/history")).resolve()
 INDEX_PATH = Path(os.getenv("INDEX_PATH", "./data/index.json")).resolve()
 ENABLE_VERSION_HISTORY = os.getenv("ENABLE_VERSION_HISTORY", "true").lower() == "true"
 HISTORY_MAX_PER_GAME = int(os.getenv("HISTORY_MAX_VERSIONS_PER_GAME", "5"))
+_MAX_SAVE_UPLOAD_BYTES = int(os.getenv("GBASYNC_MAX_SAVE_UPLOAD_BYTES", str(4 * 1024 * 1024)))
 
 store = SaveStore(
     save_root=SAVE_ROOT,
@@ -215,13 +216,21 @@ def health() -> dict[str, str]:
 
 
 @app.get("/saves", response_model=SaveListResponse, dependencies=[Depends(require_api_key)])
-def list_saves() -> SaveListResponse:
-    return SaveListResponse(saves=store.list_saves())
+def list_saves(
+    limit: int | None = Query(None, ge=1, le=10_000),
+    offset: int = Query(0, ge=0),
+) -> SaveListResponse:
+    rows = store.list_saves()
+    total = len(rows)
+    if limit is None:
+        return SaveListResponse(saves=rows, total=total)
+    return SaveListResponse(saves=rows[offset : offset + limit], total=total)
 
 
 @app.get("/conflicts", response_model=SaveListResponse, dependencies=[Depends(require_api_key)])
 def list_conflicts() -> SaveListResponse:
-    return SaveListResponse(saves=store.list_conflicts())
+    rows = store.list_conflicts()
+    return SaveListResponse(saves=rows, total=len(rows))
 
 
 @app.get("/save/{game_id}/meta", dependencies=[Depends(require_api_key)])
@@ -332,6 +341,12 @@ def put_save(
             client_clock_utc,
             platform_source,
         )
+    if len(body) > _MAX_SAVE_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"save payload exceeds max {_MAX_SAVE_UPLOAD_BYTES} bytes",
+        )
+
     meta = SaveMeta(
         game_id=game_id,
         last_modified_utc=last_modified_utc,

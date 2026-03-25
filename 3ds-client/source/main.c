@@ -15,6 +15,9 @@
 #include <time.h>
 #include <unistd.h>
 
+/** Single source for config path (also referenced in README / distribution). */
+#define GBASYNC_3DS_CONFIG_PATH "sdmc:/3ds/gba-sync/config.ini"
+
 typedef struct {
   char server_url[256];
   char api_key[128];
@@ -88,6 +91,8 @@ typedef struct {
   int uploads;
   int downloads;
   int already_up_to_date;
+  /** Set when user confirms preview with START (sync then exit app). */
+  int exit_after_sync;
 } SyncSummary;
 
 typedef struct {
@@ -1145,7 +1150,7 @@ static bool send_all_socket(int sock_fd, const unsigned char* data, size_t len) 
   return true;
 }
 
-static bool http_request(
+static bool http_request_once(
     const AppConfig* cfg,
     const char* method,
     const char* target_path,
@@ -1279,6 +1284,27 @@ static bool http_request(
   *out_body = final_payload;
   *out_body_len = final_len;
   return true;
+}
+
+/** Retries transient TCP failures (3DS Wi‑Fi); 3 attempts with 1s backoff. */
+static bool http_request(
+    const AppConfig* cfg,
+    const char* method,
+    const char* target_path,
+    const char* content_type,
+    const unsigned char* body,
+    size_t body_len,
+    int* out_status,
+    unsigned char** out_body,
+    size_t* out_body_len) {
+  const int max_attempts = 3;
+  for (int attempt = 1; attempt <= max_attempts; attempt++) {
+    if (http_request_once(
+            cfg, method, target_path, content_type, body, body_len, out_status, out_body, out_body_len))
+      return true;
+    if (attempt < max_attempts) svcSleepThread(1000000000ULL);
+  }
+  return false;
 }
 
 /* Scan JSON for any "sha256" : "..." value equal to expect (64 hex). Tolerates spaces around : . */
@@ -2626,7 +2652,7 @@ static void save_viewer_3ds(AppConfig* cfg) {
   int scroll = 0;
   const int kVisible = 14;
   const int total_rows = n_merge;
-  const char* config_path = "sdmc:/3ds/gba-sync/config.ini";
+  const char* config_path = GBASYNC_3DS_CONFIG_PATH;
   bool dirty = true;
   while (aptMainLoop()) {
     hidScanInput();
@@ -2701,7 +2727,6 @@ typedef enum {
   AP_OK = 0,
   AP_UP,
   AP_DN,
-  AP_SKIP,
   AP_CONF,
   AP_LOCK
 } AutoPlanKind;
@@ -2722,7 +2747,8 @@ static AutoPlanKind classify_auto_3ds(
     if (strcmp(l->sha256, r->sha256) == 0) return AP_OK;
     if (locked) return AP_LOCK;
     const char* base = baseline_find(baseline, n_baseline, id);
-    if (!base || base[0] == '\0') return AP_SKIP;
+    /* No baseline but both sides present: treat like conflict — user picks X/Y in apply. */
+    if (!base || base[0] == '\0') return AP_CONF;
     const int loc_eq = (strcmp(l->sha256, base) == 0);
     const int rem_eq = (strcmp(r->sha256, base) == 0);
     if (loc_eq && !rem_eq) return AP_DN;
@@ -2744,10 +2770,8 @@ static const char* plan_kind_label(AutoPlanKind k) {
       return "UPLOAD";
     case AP_DN:
       return "DOWNLOAD";
-    case AP_SKIP:
-      return "SKIP (no baseline)";
     case AP_CONF:
-      return "CONFLICT (prompt)";
+      return "CONFLICT (choose side)";
     case AP_LOCK:
       return "SKIP (locked)";
     default:
@@ -2884,7 +2908,7 @@ static int preview_auto_plan_3ds(
     BaselineRow* baseline,
     int n_baseline,
     AutoPlanRow* plan) {
-  int nu = 0, nd = 0, ns = 0, nc = 0, nl = 0, nk = 0;
+  int nu = 0, nd = 0, nc = 0, nl = 0, nk = 0;
   fill_auto_plan_merge(cfg, merge_ids, n_merge, local, lc, remote, rc, baseline, n_baseline, plan);
   for (int i = 0; i < n_merge; i++) {
     switch (plan[i].kind) {
@@ -2893,9 +2917,6 @@ static int preview_auto_plan_3ds(
         break;
       case AP_DN:
         nd++;
-        break;
-      case AP_SKIP:
-        ns++;
         break;
       case AP_CONF:
         nc++;
@@ -2926,7 +2947,8 @@ static int preview_auto_plan_3ds(
     hidScanInput();
     u32 kDown = hidKeysDown();
     if (kDown & KEY_A) return 1;
-    if (kDown & KEY_B || kDown & KEY_START) return 0;
+    if (kDown & KEY_START) return 2;
+    if (kDown & KEY_B) return 0;
     if (n_filt > 0) {
       if (kDown & KEY_DUP) {
         cursor = (cursor + total_rows - 1) % total_rows;
@@ -2954,18 +2976,24 @@ static int preview_auto_plan_3ds(
 
     consoleClear();
     printf("--- Sync preview ---\n");
-    printf("UP:%d DN:%d SKIP:%d CONF:%d LOCK:%d\n", nu, nd, ns, nc, nl);
+    printf("UP:%d DN:%d CONF:%d LOCK:%d\n", nu, nd, nc, nl);
     printf("\n");
     {
       const int kPrevCol = 20;
       printf("%-*s%s\n", kPrevCol, "a: confirm", "");
+      printf("%-*s%s\n", kPrevCol, "START: sync & exit", "");
       printf("%-*s%s\n", kPrevCol, "b: back", "");
     }
     printf("\n");
     for (int row = scroll; row < scroll + kVisible && row < n_filt; row++) {
       int pi = filt[row];
       char mark = (row == cursor) ? '>' : ' ';
-      printf("%c %.28s  %s\n", mark, plan[pi].id, plan_kind_label(plan[pi].kind));
+      {
+        const RemoteSave* rr = find_remote_by_id(remote, rc, plan[pi].id);
+        const char* disp =
+            (rr && rr->display_name[0] != '\0') ? rr->display_name : plan[pi].id;
+        printf("%c %.28s  %s\n", mark, disp, plan_kind_label(plan[pi].kind));
+      }
     }
     dirty = false;
     gfxFlushBuffers();
@@ -3104,7 +3132,7 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
   fill_auto_plan_merge(cfg, merge_ids, n_merge, local, local_count, remote, remote_count, baseline, n_baseline, plan);
 
   {
-    int nu = 0, nd = 0, ns = 0, nc = 0, nl = 0, nk = 0;
+    int nu = 0, nd = 0, nc = 0, nl = 0, nk = 0;
     for (int i = 0; i < n_merge; i++) {
       switch (plan[i].kind) {
         case AP_UP:
@@ -3112,9 +3140,6 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
           break;
         case AP_DN:
           nd++;
-          break;
-        case AP_SKIP:
-          ns++;
           break;
         case AP_CONF:
           nc++;
@@ -3167,24 +3192,28 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
   /* After "Already Up To Date" early return — avoids extra HTTP wait before post-sync menu. */
   debug_report_sync_start_3ds(cfg, local_count, n_baseline);
 
-  if (!preview_auto_plan_3ds(
-          cfg,
-          merge_ids,
-          n_merge,
-          local,
-          local_count,
-          remote,
-          remote_count,
-          baseline,
-          n_baseline,
-          plan)) {
-    printf("Preview cancelled.\n");
-    free(plan);
-    free(merge_ids);
-    free(baseline);
-    free(local);
-    free(remote);
-    return summary;
+  {
+    int pv = preview_auto_plan_3ds(
+        cfg,
+        merge_ids,
+        n_merge,
+        local,
+        local_count,
+        remote,
+        remote_count,
+        baseline,
+        n_baseline,
+        plan);
+    if (pv == 0) {
+      printf("Preview cancelled.\n");
+      free(plan);
+      free(merge_ids);
+      free(baseline);
+      free(local);
+      free(remote);
+      return summary;
+    }
+    if (pv == 2) summary.exit_after_sync = 1;
   }
   free(plan);
 
@@ -3205,10 +3234,7 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
       }
       const char* base = baseline_find(baseline, n_baseline, id);
       if (!base || base[0] == '\0') {
-        printf(
-            "%s: SKIP (no baseline yet — 3DS ignores unreliable file dates). "
-            "Use X upload or Y download once per game, then Auto works.\n",
-            id);
+        resolve_both_changed_conflict(cfg, source_tag, l, r, id, local, local_count, baseline, &n_baseline, &summary);
         continue;
       }
       const int loc_eq = (strcmp(l->sha256, base) == 0);
@@ -3289,6 +3315,93 @@ static bool choose_action(SyncAction* out_action, bool* exit_app) {
   return false;
 }
 
+/** -1 = error; else games needing Auto (not OK, not locked). */
+static int count_pending_auto_sync_actions(const AppConfig* cfg) {
+  LocalSave* local = (LocalSave*)calloc(MAX_SAVES, sizeof(LocalSave));
+  RemoteSave* remote = (RemoteSave*)calloc(MAX_SAVES, sizeof(RemoteSave));
+  BaselineRow* baseline = (BaselineRow*)calloc((size_t)MAX_SAVES, sizeof(BaselineRow));
+  if (!local || !remote || !baseline) {
+    free(local);
+    free(remote);
+    free(baseline);
+    return -1;
+  }
+  int n_baseline = baseline_load_merged(cfg, baseline, MAX_SAVES);
+  int local_count = scan_all_local_saves(cfg, local, MAX_SAVES);
+  int status = 0;
+  unsigned char* body = NULL;
+  size_t body_len = 0;
+  if (!http_request(cfg, "GET", "/saves", NULL, NULL, 0, &status, &body, &body_len) || status != 200) {
+    free(body);
+    free(baseline);
+    free(local);
+    free(remote);
+    return -1;
+  }
+  int remote_count = parse_remote_saves((const char*)body, remote, MAX_SAVES);
+  free(body);
+  const int merge_cap = MAX_SAVES * 2;
+  char (*merge_ids)[128] = calloc((size_t)merge_cap, sizeof(*merge_ids));
+  if (!merge_ids) {
+    free(baseline);
+    free(local);
+    free(remote);
+    return -1;
+  }
+  int n_merge = 0;
+  int i;
+  for (i = 0; i < remote_count; i++) {
+    n_merge = add_merge_id(merge_ids, n_merge, merge_cap, remote[i].game_id);
+  }
+  {
+    char (*local_only)[128] = calloc((size_t)MAX_SAVES, sizeof(*local_only));
+    if (!local_only) {
+      free(merge_ids);
+      free(baseline);
+      free(local);
+      free(remote);
+      return -1;
+    }
+    int n_lo = 0;
+    for (i = 0; i < local_count; i++) {
+      if (!find_remote_by_id(remote, remote_count, local[i].game_id)) {
+        copy_cstr(local_only[n_lo++], 128, local[i].game_id);
+      }
+    }
+    qsort(local_only, (size_t)n_lo, sizeof(local_only[0]), cmp_merge_id_str);
+    for (i = 0; i < n_lo; i++) {
+      n_merge = add_merge_id(merge_ids, n_merge, merge_cap, local_only[i]);
+    }
+    free(local_only);
+  }
+  if (n_merge <= 0) {
+    free(merge_ids);
+    free(baseline);
+    free(local);
+    free(remote);
+    return 0;
+  }
+  AutoPlanRow* plan = (AutoPlanRow*)calloc((size_t)n_merge, sizeof(AutoPlanRow));
+  if (!plan) {
+    free(merge_ids);
+    free(baseline);
+    free(local);
+    free(remote);
+    return -1;
+  }
+  fill_auto_plan_merge(cfg, merge_ids, n_merge, local, local_count, remote, remote_count, baseline, n_baseline, plan);
+  int pending = 0;
+  for (i = 0; i < n_merge; i++) {
+    if (plan[i].kind != AP_OK && plan[i].kind != AP_LOCK) pending++;
+  }
+  free(plan);
+  free(merge_ids);
+  free(baseline);
+  free(local);
+  free(remote);
+  return pending;
+}
+
 static void run_dropbox_sync_once_3ds(const AppConfig* cfg, bool* quit_app) {
   printf("\nDropbox sync now...\n");
   int st = 0;
@@ -3347,7 +3460,7 @@ int main(int argc, char** argv) {
 
   AppConfig cfg;
   config_init(&cfg);
-  load_config(&cfg, "sdmc:/3ds/gba-sync/config.ini");
+  load_config(&cfg, GBASYNC_3DS_CONFIG_PATH);
 
   static u32* soc_buffer = NULL;
   soc_buffer = (u32*)memalign(0x1000, SOC_BUFFERSIZE);
@@ -3386,6 +3499,10 @@ int main(int argc, char** argv) {
         }
       }
       sync_status_print_menu(&cfg);
+      {
+        int pend = count_pending_auto_sync_actions(&cfg);
+        if (pend > 0) printf("  %d game(s) need sync (run Auto)\n\n", pend);
+      }
       /* Two columns: sync actions (left) | R / SELECT / START hints (right) */
       {
         const int kMenuLeftCol = 20;
@@ -3421,7 +3538,11 @@ int main(int argc, char** argv) {
         wait_after_sync_3ds(&quit_app, summary.downloads > 0 || summary.already_up_to_date);
       } else {
         SyncSummary summary = run_sync(&cfg, action, NULL);
-        wait_after_sync_3ds(&quit_app, summary.downloads > 0 || summary.already_up_to_date);
+        if (summary.exit_after_sync) {
+          quit_app = true;
+        } else {
+          wait_after_sync_3ds(&quit_app, summary.downloads > 0 || summary.already_up_to_date);
+        }
       }
       manual_filter_free(&xy);
     }

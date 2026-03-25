@@ -220,7 +220,8 @@ def admin_list_saves(_: AdminDep, request: Request) -> dict[str, Any]:
     from .models import SaveListResponse
 
     store = _get_store(request)
-    return SaveListResponse(saves=store.list_saves()).model_dump()
+    rows = store.list_saves()
+    return SaveListResponse(saves=rows, total=len(rows)).model_dump()
 
 
 @router.get("/api/save/{game_id}/download")

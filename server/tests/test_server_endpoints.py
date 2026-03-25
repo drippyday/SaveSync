@@ -431,3 +431,47 @@ def test_save_order_admin_and_list_saves(tmp_path: Path) -> None:
     body = r2.json()["saves"]
     assert [x["game_id"] for x in body] == perm
     assert [x["list_order"] for x in body] == [0, 1]
+
+
+def test_list_saves_pagination_and_total(tmp_path: Path) -> None:
+    client = _make_client(tmp_path)
+    for gid, payload in (("pag-a", b"a"), ("pag-b", b"b"), ("pag-c", b"c")):
+        sha = hashlib.sha256(payload).hexdigest()
+        params = {
+            "last_modified_utc": "2026-03-17T21:00:00+00:00",
+            "sha256": sha,
+            "size_bytes": len(payload),
+            "filename_hint": f"{gid}.sav",
+            "platform_source": "test",
+        }
+        assert client.put(f"/save/{gid}", params=params, content=payload, headers=_auth_headers()).status_code == 200
+    full = client.get("/saves", headers=_auth_headers())
+    assert full.status_code == 200
+    j = full.json()
+    assert j["total"] == 3
+    assert len(j["saves"]) == 3
+    page = client.get("/saves", headers=_auth_headers(), params={"limit": 2, "offset": 1})
+    assert page.status_code == 200
+    jp = page.json()
+    assert jp["total"] == 3
+    assert len(jp["saves"]) == 2
+
+
+def test_put_save_rejects_oversized_payload(tmp_path: Path) -> None:
+    old = main_mod._MAX_SAVE_UPLOAD_BYTES
+    main_mod._MAX_SAVE_UPLOAD_BYTES = 32
+    try:
+        client = _make_client(tmp_path)
+        data = b"a" * 64
+        sha = hashlib.sha256(data).hexdigest()
+        params = {
+            "last_modified_utc": "2026-03-17T21:00:00+00:00",
+            "sha256": sha,
+            "size_bytes": len(data),
+            "filename_hint": "t.sav",
+            "platform_source": "test",
+        }
+        r = client.put("/save/huge", params=params, content=data, headers=_auth_headers())
+        assert r.status_code == 413
+    finally:
+        main_mod._MAX_SAVE_UPLOAD_BYTES = old

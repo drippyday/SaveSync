@@ -814,7 +814,7 @@ static bool jsonBodyAppliedIsFalse(std::string_view body) {
   return false;
 }
 
-static bool http_request(
+static bool http_request_once(
     const Config& cfg,
     const std::string& method,
     const std::string& target_path,
@@ -899,6 +899,23 @@ static bool http_request(
     out_body.assign(raw_body.begin(), raw_body.begin() + static_cast<std::ptrdiff_t>(use));
   }
   return true;
+}
+
+/** Retries transient TCP failures; 3 attempts with 1s backoff. */
+static bool http_request(
+    const Config& cfg,
+    const std::string& method,
+    const std::string& target_path,
+    const std::vector<unsigned char>& body,
+    int& out_status,
+    std::vector<unsigned char>& out_body,
+    const char* content_type = nullptr) {
+  constexpr int kMax = 3;
+  for (int attempt = 1; attempt <= kMax; ++attempt) {
+    if (http_request_once(cfg, method, target_path, body, out_status, out_body, content_type)) return true;
+    if (attempt < kMax) svcSleepThread(1000000000ULL);
+  }
+  return false;
 }
 
 struct SavesParseResult {
@@ -1662,7 +1679,6 @@ enum class AutoPlanKind {
   Ok,
   Upload,
   Download,
-  SkipNoBaseline,
   Conflict,
 };
 
@@ -1683,7 +1699,7 @@ static AutoPlanKind classify_auto_row(
     if (l->sha256 == r->sha256) return AutoPlanKind::Ok;
     if (locked) return AutoPlanKind::Locked;
     std::string base_sha;
-    if (!baseline_get_sha(baseline, id, &base_sha)) return AutoPlanKind::SkipNoBaseline;
+    if (!baseline_get_sha(baseline, id, &base_sha)) return AutoPlanKind::Conflict;
     const bool loc_eq = (strcasecmp(l->sha256.c_str(), base_sha.c_str()) == 0);
     const bool rem_eq = (strcasecmp(r->sha256.c_str(), base_sha.c_str()) == 0);
     if (loc_eq && !rem_eq) return AutoPlanKind::Download;
@@ -1785,7 +1801,8 @@ static void build_auto_plan_vector(
 }
 
 static void recount_auto_plan(const std::vector<AutoPlanRow>& plan, int* nu, int* nd, int* ns, int* nc, int* nl, int* nk) {
-  int u = 0, d = 0, s = 0, c = 0, l = 0, k = 0;
+  int u = 0, d = 0, c = 0, l = 0, k = 0;
+  if (ns) *ns = 0;
   for (const auto& row : plan) {
     switch (row.kind) {
       case AutoPlanKind::Upload:
@@ -1793,9 +1810,6 @@ static void recount_auto_plan(const std::vector<AutoPlanRow>& plan, int* nu, int
         break;
       case AutoPlanKind::Download:
         d++;
-        break;
-      case AutoPlanKind::SkipNoBaseline:
-        s++;
         break;
       case AutoPlanKind::Conflict:
         c++;
@@ -1810,7 +1824,7 @@ static void recount_auto_plan(const std::vector<AutoPlanRow>& plan, int* nu, int
   }
   if (nu) *nu = u;
   if (nd) *nd = d;
-  if (ns) *ns = s;
+  if (ns) *ns = 0;
   if (nc) *nc = c;
   if (nl) *nl = l;
   if (nk) *nk = k;
@@ -1826,10 +1840,8 @@ static const char* auto_plan_kind_label(AutoPlanKind k) {
       return "UPLOAD";
     case AutoPlanKind::Download:
       return "DOWNLOAD";
-    case AutoPlanKind::SkipNoBaseline:
-      return "SKIP (no baseline)";
     case AutoPlanKind::Conflict:
-      return "CONFLICT (prompt)";
+      return "CONFLICT (choose side)";
     default:
       return "?";
   }
@@ -1837,7 +1849,8 @@ static const char* auto_plan_kind_label(AutoPlanKind k) {
 
 static constexpr const char kSwitchConfigIni[] = "sdmc:/switch/gba-sync/config.ini";
 
-static bool preview_auto_plan(
+/** 0 = cancel, 1 = confirm, 2 = confirm and exit app after apply. */
+static int preview_auto_plan(
     PadState* pad,
     Config& cfg,
     const std::vector<std::string>& merge_ids,
@@ -1873,8 +1886,9 @@ static bool preview_auto_plan(
   while (appletMainLoop()) {
     padUpdate(pad);
     const u64 down = padGetButtonsDown(pad);
-    if (down & HidNpadButton_A) return true;
-    if (down & HidNpadButton_B) return false;
+    if (down & HidNpadButton_A) return 1;
+    if (down & HidNpadButton_Plus) return 2;
+    if (down & HidNpadButton_B) return 0;
     if (n_filt > 0) {
       if (down & HidNpadButton_Up) {
         cursor = (cursor + total_rows - 1) % total_rows;
@@ -1898,23 +1912,27 @@ static bool preview_auto_plan(
 
     consoleClear();
     printf("--- Sync preview ---\n");
-    printf("UP:%d DOWN:%d SKIP:%d CONF:%d LOCK:%d\n", nu, nd, ns, nc, nl);
+    printf("UP:%d DOWN:%d CONF:%d LOCK:%d\n", nu, nd, nc, nl);
     printf("\n");
     {
       constexpr int kPrevCol = 20;
       printf("%-*s%s\n", kPrevCol, "A: confirm", "");
+      printf("%-*s%s\n", kPrevCol, "+: sync & exit", "");
       printf("%-*s%s\n", kPrevCol, "B: back", "");
     }
     printf("\n");
     for (int row = scroll; row < std::min(scroll + kVisible, n_filt); row++) {
       const char mark = (row == cursor) ? '>' : ' ';
       const AutoPlanRow& pr = plan[filt[static_cast<size_t>(row)]];
-      printf("%c %.28s  %s\n", mark, pr.id.c_str(), auto_plan_kind_label(pr.kind));
+      std::string disp = pr.id;
+      const auto rit = remote.find(pr.id);
+      if (rit != remote.end() && !rit->second.display_name.empty()) disp = rit->second.display_name;
+      printf("%c %.28s  %s\n", mark, disp.c_str(), auto_plan_kind_label(pr.kind));
     }
     dirty = false;
     consoleUpdate(NULL);
   }
-  return false;
+  return 0;
 }
 
 static void debug_report_sync_start_switch(const Config& cfg, const std::vector<LocalSave>& local) {
@@ -2479,8 +2497,10 @@ static std::vector<std::string> run_sync(
     Config& cfg,
     SyncAction action,
     const SyncManualFilter* xy_filter,
-    PadState* pad) {
+    PadState* pad,
+    bool* out_exit_after_sync) {
   std::vector<std::string> logs;
+  if (out_exit_after_sync) *out_exit_after_sync = false;
   if (action == SyncAction::Auto) {
     printf("\n");
     printf("Scanning local saves...\n");
@@ -2578,9 +2598,17 @@ static std::vector<std::string> run_sync(
     return logs;
   }
 
-  if (!pad || !preview_auto_plan(pad, cfg, merge_ids, local_by_id, remote, baseline, plan)) {
+  if (!pad) {
     logs.push_back("Preview cancelled.");
     return logs;
+  }
+  {
+    const int pv = preview_auto_plan(pad, cfg, merge_ids, local_by_id, remote, baseline, plan);
+    if (pv == 0) {
+      logs.push_back("Preview cancelled.");
+      return logs;
+    }
+    if (pv == 2 && out_exit_after_sync) *out_exit_after_sync = true;
   }
 
   /* Blank line before per-game apply lines (matches 3DS printf("\n") after confirm). */
@@ -2605,9 +2633,11 @@ static std::vector<std::string> run_sync(
       }
       std::string base_sha;
       if (!baseline_get_sha(baseline, id, &base_sha)) {
-        logs.push_back(
-            id +
-            ": SKIP (no baseline yet — use X or Y once per game, then Auto works)");
+        if (pad) {
+          resolve_both_changed_conflict_switch(pad, cfg, id, l, r, plat, local, logs, baseline);
+        } else {
+          logs.push_back(id + ": SKIP (no baseline — need interactive resolution)");
+        }
         continue;
       }
       const bool loc_eq = (strcasecmp(l.sha256.c_str(), base_sha.c_str()) == 0);
@@ -2690,6 +2720,27 @@ static bool choose_action(PadState* pad, SyncAction* out_action) {
   return false;
 }
 
+/** -1 on error; else games needing Auto (not OK, not locked). */
+static int count_pending_auto_sync_switch(const Config& cfg) {
+  auto local = scan_all_local_saves(cfg);
+  std::map<std::string, LocalSave> local_by_id;
+  for (const auto& s : local) local_by_id[s.game_id] = s;
+  std::vector<BaselineRow> baseline = baseline_load_merged(cfg);
+  int status = 0;
+  std::vector<unsigned char> body;
+  if (!http_request(cfg, "GET", "/saves", {}, status, body) || status != 200) return -1;
+  const SavesParseResult pr = parse_saves_json(std::string(body.begin(), body.end()));
+  const auto& remote = pr.by_id;
+  std::vector<std::string> merge_ids = build_merge_ids_filtered(cfg, local_by_id, remote, &pr.order);
+  std::vector<AutoPlanRow> plan;
+  build_auto_plan_vector(cfg, merge_ids, local_by_id, remote, baseline, plan);
+  int n = 0;
+  for (const auto& row : plan) {
+    if (row.kind != AutoPlanKind::Ok && row.kind != AutoPlanKind::Locked) n++;
+  }
+  return n;
+}
+
 static void wait_after_sync_switch(PadState* pad, bool* quit_app) {
   printf("\nA: main menu   +: exit app\n");
   while (appletMainLoop()) {
@@ -2747,6 +2798,10 @@ int main(int argc, char** argv) {
       printf("\n");
       sync_status_print_menu(cfg);
       {
+        const int pend = count_pending_auto_sync_switch(cfg);
+        if (pend > 0) printf("  %d game(s) need sync (run Auto)\n\n", pend);
+      }
+      {
         constexpr int kMenuLeftCol = 20;
         printf("%-*s%s\n", kMenuLeftCol, "A: Auto sync", "R: save viewer");
         printf("%-*s%s\n", kMenuLeftCol, "X: upload only", "-: Dropbox sync");
@@ -2772,14 +2827,19 @@ int main(int argc, char** argv) {
         continue;
       } else if (action == SyncAction::UploadOnly) {
         if (!pick_upload_selection(&pad, cfg, &xy)) continue;
-        sync_logs = run_sync(cfg, action, &xy, &pad);
+        sync_logs = run_sync(cfg, action, &xy, &pad, nullptr);
       } else if (action == SyncAction::DownloadOnly) {
         if (!pick_download_selection(&pad, cfg, &xy)) continue;
-        sync_logs = run_sync(cfg, action, &xy, &pad);
+        sync_logs = run_sync(cfg, action, &xy, &pad, nullptr);
       } else {
-        sync_logs = run_sync(cfg, action, nullptr, &pad);
+        bool exit_after = false;
+        sync_logs = run_sync(cfg, action, nullptr, &pad, &exit_after);
         for (const auto& line : sync_logs) printf("%s\n", line.c_str());
-        wait_after_sync_switch(&pad, &quit_app);
+        if (exit_after) {
+          quit_app = true;
+        } else {
+          wait_after_sync_switch(&pad, &quit_app);
+        }
         continue;
       }
       for (const auto& line : sync_logs) printf("%s\n", line.c_str());

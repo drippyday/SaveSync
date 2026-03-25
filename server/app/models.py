@@ -125,6 +125,10 @@ class RevisionKeepPatch(BaseModel):
 
 class SaveListResponse(BaseModel):
     saves: list[SaveListItem]
+    total: int | None = Field(
+        default=None,
+        description="Total rows before limit/offset slicing; equals len(saves) when not paginating.",
+    )
 
 
 class AdminSettingsPatch(BaseModel):

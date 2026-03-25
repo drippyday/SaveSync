@@ -8,7 +8,7 @@ BasicInfo:
 TitleInfo:
   UniqueId                : 0x5A5E0
   Category                : Application
-  Version                 : 0x2710
+  Version                 : 0x4361
 
 Option:
   EnableCrypt             : False
