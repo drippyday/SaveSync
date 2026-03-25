@@ -15,11 +15,11 @@ FastAPI backend for binary save storage and metadata coordination.
 ## Endpoints
 
 - `GET /health`
-- `GET /saves`
+- `GET /saves` — optional query params **`limit`** (1–10000) and **`offset`**; JSON includes **`total`** (full count before slicing). Omit **`limit`** for the full ordered list (default client behavior).
 - `GET /conflicts`
 - `GET /save/{game_id}/meta`
 - `GET /save/{game_id}`
-- `PUT /save/{game_id}`
+- `PUT /save/{game_id}` — body size capped by **`GBASYNC_MAX_SAVE_UPLOAD_BYTES`** (default 4 MiB; **413** if larger)
 - `DELETE /save/{game_id}` — remove index row and delete the stored blob (cleanup / bad test data)
 - `POST /resolve/{game_id}`
 

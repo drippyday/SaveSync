@@ -260,9 +260,9 @@ rom_extension=.gba
 
 Launch from Homebrew Menu.
 
-**Main menu:** **A** Auto sync, **X** upload-only, **Y** download-only, **+** exits the app. A short **status line** shows last sync / server / Dropbox (from **`.gbasync-status`** next to your saves).
+**Main menu:** **A** Auto sync, **X** upload-only, **Y** download-only, **+** exits the app. A short **status line** shows last sync / server / Dropbox (from **`.gbasync-status`** next to your saves). When applicable, **`N game(s) need sync (run Auto)`** summarizes games that still need an Auto action; that count is **cached** after it is computed once and **refreshes** when you return from Auto sync, upload-only, download-only, Dropbox sync, or the **save viewer** (not on every menu redraw).
 
-**Auto sync** runs a **preview** of planned actions per game (upload/download/skip/conflict/locked — **non-OK rows only**), then **A** applies or **B** returns to the menu (**+** does not cancel on the preview — avoids accidental backs). Preview is **confirm-only** (no lock editing there). Change **locks** from the main menu **Save viewer** (**R**): highlight a row and **R** toggles lock; **`locked_ids=`** is written to `sdmc:/switch/gba-sync/config.ini`. The viewer lists **Display name** when the server has one; otherwise **`game_id`**. **A** opens **history / restore** (**R** in history toggles **keep**).
+**Auto sync** runs a **preview** of planned actions per game (upload/download/**conflict**/locked — **non-OK rows only**; **no-baseline** divergences show as **CONFLICT**, not SKIP). **A** applies; **B** cancels; **+** (**Plus**) applies and **exits the app**. Preview rows use **Display name** when the server sent one; otherwise **`game_id`**. **+** does not cancel the preview when confirming with **A** (avoids accidental backs). Preview is **confirm-only** (no lock editing there). Change **locks** from the main menu **Save viewer** (**R**): highlight a row and **R** toggles lock; **`locked_ids=`** is written to `sdmc:/switch/gba-sync/config.ini`. The viewer lists **Display name** when the server has one; otherwise **`game_id`**. **A** opens **history / restore** (**R** in history toggles **keep**).
 
 After logs finish, a **done** screen appears: **A** returns to the main menu; **+** exits the app.
 
@@ -306,9 +306,9 @@ rom_extension=.gba
 
 Launch from Homebrew Launcher.
 
-**Main menu:** **A** / **X** / **Y** as labeled; **START** exits to the “Press START to exit” end screen (or exits immediately if you already chose **START** on the post-sync screen). A **status line** shows last sync / server / Dropbox (from **`.gbasync-status`** in the active save folder).
+**Main menu:** **A** / **X** / **Y** as labeled; **START** exits to the “Press START to exit” end screen (or exits immediately if you already chose **START** on the post-sync screen). A **status line** shows last sync / server / Dropbox (from **`.gbasync-status`** in the active save folder). When applicable, **`N game(s) need sync (run Auto)`** uses the same **caching** rules as Switch (see above).
 
-**Auto sync** shows a **preview** of planned actions per game (**non-OK rows only**), then **A** applies or **B** / **START** returns to the menu. Preview is **confirm-only**. **Save viewer** (main menu **R**): **R** toggles lock for the highlighted row and updates **`sdmc:/3ds/gba-sync/config.ini`** (`locked_ids=`). Rows show **Display name** when the server has one; otherwise **`game_id`**. **A** opens history (**R** in history toggles **keep**).
+**Auto sync** shows a **preview** of planned actions (**non-OK rows only**), then **A** applies, **B** cancels, or **START** applies and **exits the app**. Preview lists **Display name** when available; otherwise **`game_id`**. Preview is **confirm-only**. **Save viewer** (main menu **R**): **R** toggles lock for the highlighted row and updates **`sdmc:/3ds/gba-sync/config.ini`** (`locked_ids=`). Rows show **Display name** when the server has one; otherwise **`game_id`**. **A** opens history (**R** in history toggles **keep**).
 
 After sync logs, a **done** screen appears: **A** returns to the main menu; **START** exits the app (skips the duplicate exit prompt).
 
@@ -344,7 +344,7 @@ pokemon-emerald: DOWNLOADED
 2. On a console with newer progress, press **`A`** (Auto sync): **Switch** and **3DS** both use each game’s save **SHA256** and a small **`.gbasync-baseline`** file next to your `.sav` files (legacy **`.savesync-baseline`** is still supported; unreliable SD modification times are not used for merge decisions on either console). Or use upload-only (`X`) to force-push chosen saves.
 3. On the other console, press **`A`** again or download-only (`Y`) to pull saves from the server.
 
-The first time a game has no baseline row yet, Auto sync logs **SKIP (no baseline yet)** — use **`X`** or **`Y`** once for that game so Auto can track changes afterward. If **local and server both diverged** from the last known baseline, **3DS** and **Switch** show a **Conflict** screen: **`X`** uploads local (with force), **`Y`** downloads from server, **`B`** skips for now.
+If a game exists **both locally and on the server** with **different hashes** but **no baseline row** for that game yet (typical first sync on a device), **Auto** opens the **Conflict** screen instead of logging SKIP: **`X`** uploads local (with force), **`Y`** downloads from the server, **`B`** skips. The **first-time** copy explains that there is **no sync history on this device yet**; pick **X** or **Y** to seed **`.gbasync-baseline`**. If **local and server both diverged** from an **existing** baseline, the same **X/Y/B** screen appears with wording about **both sides changing since the last successful sync**. **Local-only** or **server-only** games still **upload** or **download** without this prompt.
 
 After a run, read the on-screen log, then use the **done** prompt (**A** / **+** on Switch; **A** / **START** on 3DS) so the menu does not clear immediately.
 
@@ -363,7 +363,7 @@ Quick local smoke test (server + bridge only):
 
 ## 7) Server index vs files (`index.json`)
 
-The server’s **`GET /saves`** list is driven by the **metadata index** (default host path **`save_data/index.json`** when using repo Docker layout), not by scanning `save_data/saves/` alone. Uploads (curl, bridge, consoles) **register rows** in that index.
+The server’s **`GET /saves`** list is driven by the **metadata index** (default host path **`save_data/index.json`** when using repo Docker layout), not by scanning `save_data/saves/` alone. Uploads (curl, bridge, consoles) **register rows** in that index. The JSON response includes **`total`** (row count). Optional query parameters **`limit`** and **`offset`** paginate the list for large libraries (see **`server/README.md`**). **`PUT /save/{game_id}`** rejects bodies larger than **`GBASYNC_MAX_SAVE_UPLOAD_BYTES`** (default 4 MiB).
 
 If you **delete local test `.sav` files** or remove blobs on disk but leave the index alone, clients can still **see** those `game_id`s and hit **404** or upload errors until you:
 

@@ -9,7 +9,7 @@ Static browser UI for operating a running **GBAsync server** (dashboard, saves, 
 | Area | Purpose |
 |------|---------|
 | **Dashboard** | Snapshot: Dropbox mode, save/conflict counts, data paths on disk; **max history versions per game** (read/write via settings API). |
-| **Saves** | **Table** (desktop) and **cards** (narrow screens): hash preview, size, conflict flag, last modified / server upload time. Per row: **Download** (blob), **Upload** (pick a `.sav` to replace the server copy — same pipeline as `PUT /save` with `force`; success **modal**), **history** modal, **Display name** (prompt). **Drag** rows to reorder when the search filter is **empty**, then **Save row order** → **`PUT /admin/api/save-order`** (same order as **`GET /saves`** for clients). |
+| **Saves** | **Table** (desktop) and **cards** (narrow screens): hash preview, size, conflict flag, last modified / server upload time. Per row: **Download** (blob), **Upload** (pick a `.sav` to replace the server copy — same pipeline as `PUT /save` with `force`; success **modal**), **history** modal (**Done** in the modal **header** on narrow screens), **Display name** (prompt). **Drag** rows to reorder when the search filter is **empty**, then **Save row order** → **`PUT /admin/api/save-order`** (same order as **`GET /saves`** for clients). |
 | **Conflicts** | Lists saves with `conflict: true`; link to resolve (opens **Actions** tab). |
 | **Index routing** | View and **edit** **aliases**, **`rom_sha1`** map, **tombstones**; **Save** writes **`PUT /admin/api/index-routing`**. |
 | **Slot map** | If **`GBASYNC_SLOT_MAP_PATH`** (or legacy **`SAVESYNC_SLOT_MAP_PATH`**) points at a JSON file the server can read, shows path and parsed JSON; otherwise explains that it is optional. |

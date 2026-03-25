@@ -77,7 +77,9 @@ See **`bridge/README.md`** for script details and **`docs/USER_GUIDE.md`** for D
 | Doc | Purpose |
 |-----|---------|
 | **`docs/USER_GUIDE.md`** | Full setup: server, bridge, Switch, 3DS, Dropbox, troubleshooting |
+| **`docs/GITHUB_RELEASE_NOTES_v1.1.0.md`** | v1.1.0 shipped changes (admin, server, Switch, 3DS) |
 | **`docs/RELEASE_NOTES_v1.0.0.md`** | v1.0.0 full product summary |
+| **`docs/GITHUB_RELEASE_NOTES_v1.0.0.md`** | v1.0.0 GitHub-style release notes |
 | **`docs/RELEASE_NOTES_v0.1.*.md`** | Earlier incremental release notes |
 | **`dist/README.md`** | Release artifacts and how they map to installs |
 | **`admin-web/README.md`** | Optional admin UI — auth, tabs, related server routes |

@@ -2093,7 +2093,7 @@ static bool get_one_save(
   return false;
 }
 
-/* Both local and server differ from baseline — wait for X/Y instead of finishing sync with SKIP. */
+/* Both sides differ: no baseline yet, or both diverged from baseline — X/Y/B instead of SKIP. */
 static void resolve_both_changed_conflict(
     const AppConfig* cfg,
     const char* source_tag,
@@ -2104,14 +2104,20 @@ static void resolve_both_changed_conflict(
     int n_local,
     BaselineRow* baseline,
     int* n_baseline,
-    SyncSummary* summary) {
+    SyncSummary* summary,
+    int no_sync_history) {
   consoleClear();
   printf("\n");
   printf("  -------- Conflict --------\n");
   printf("\n");
   printf("  %s\n\n", id);
-  printf("  Local and server both changed since\n");
-  printf("  the last successful sync.\n\n");
+  if (no_sync_history) {
+    printf("  No sync history on this device yet.\n");
+    printf("  Choose which version to keep:\n\n");
+  } else {
+    printf("  Local and server both changed since\n");
+    printf("  the last successful sync.\n\n");
+  }
   printf("  X   Upload local (overwrite server)\n");
   printf("  Y   Download server (overwrite local)\n");
   printf("  B   Skip for now\n");
@@ -3234,7 +3240,8 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
       }
       const char* base = baseline_find(baseline, n_baseline, id);
       if (!base || base[0] == '\0') {
-        resolve_both_changed_conflict(cfg, source_tag, l, r, id, local, local_count, baseline, &n_baseline, &summary);
+        resolve_both_changed_conflict(
+            cfg, source_tag, l, r, id, local, local_count, baseline, &n_baseline, &summary, 1);
         continue;
       }
       const int loc_eq = (strcmp(l->sha256, base) == 0);
@@ -3251,7 +3258,8 @@ static SyncSummary run_sync(AppConfig* cfg, SyncAction action, const SyncManualF
           summary.uploads++;
         }
       } else if (!loc_eq && !rem_eq) {
-        resolve_both_changed_conflict(cfg, source_tag, l, r, id, local, local_count, baseline, &n_baseline, &summary);
+        resolve_both_changed_conflict(
+            cfg, source_tag, l, r, id, local, local_count, baseline, &n_baseline, &summary, 0);
       }
     } else if (l && !r) {
       char uploaded_sha[65];
@@ -3479,6 +3487,8 @@ int main(int argc, char** argv) {
   } else if (strncmp(cfg.server_url, "http://", 7) != 0) {
     printf("GBA Sync (3DS MVP)\n\nERROR: use http:// URL for 3DS MVP\n");
   } else {
+    /* -1 = stale: recompute badge (expensive). Cached so we don't rescan + GET /saves every menu draw. */
+    int cached_pending_sync_badge = -1;
     while (aptMainLoop() && !quit_app) {
       consoleClear();
       printf("GBA Sync (3DS MVP)\n");
@@ -3500,8 +3510,12 @@ int main(int argc, char** argv) {
       }
       sync_status_print_menu(&cfg);
       {
-        int pend = count_pending_auto_sync_actions(&cfg);
-        if (pend > 0) printf("  %d game(s) need sync (run Auto)\n\n", pend);
+        if (cached_pending_sync_badge < 0) {
+          cached_pending_sync_badge = count_pending_auto_sync_actions(&cfg);
+        }
+        if (cached_pending_sync_badge > 0) {
+          printf("  %d game(s) need sync (run Auto)\n\n", cached_pending_sync_badge);
+        }
       }
       /* Two columns: sync actions (left) | R / SELECT / START hints (right) */
       {
@@ -3520,8 +3534,10 @@ int main(int argc, char** argv) {
 
       if (action == SYNC_ACTION_DROPBOX_SYNC) {
         run_dropbox_sync_once_3ds(&cfg, &quit_app);
+        cached_pending_sync_badge = -1;
       } else if (action == SYNC_ACTION_SAVE_VIEWER) {
         save_viewer_3ds(&cfg);
+        cached_pending_sync_badge = -1;
       } else if (action == SYNC_ACTION_UPLOAD_ONLY) {
         if (!pick_upload_selection_3ds(&cfg, &xy)) {
           manual_filter_free(&xy);
@@ -3529,6 +3545,7 @@ int main(int argc, char** argv) {
         }
         SyncSummary summary = run_sync(&cfg, action, &xy);
         wait_after_sync_3ds(&quit_app, summary.downloads > 0 || summary.already_up_to_date);
+        cached_pending_sync_badge = -1;
       } else if (action == SYNC_ACTION_DOWNLOAD_ONLY) {
         if (!pick_download_selection_3ds(&cfg, &xy)) {
           manual_filter_free(&xy);
@@ -3536,6 +3553,7 @@ int main(int argc, char** argv) {
         }
         SyncSummary summary = run_sync(&cfg, action, &xy);
         wait_after_sync_3ds(&quit_app, summary.downloads > 0 || summary.already_up_to_date);
+        cached_pending_sync_badge = -1;
       } else {
         SyncSummary summary = run_sync(&cfg, action, NULL);
         if (summary.exit_after_sync) {
@@ -3543,6 +3561,7 @@ int main(int argc, char** argv) {
         } else {
           wait_after_sync_3ds(&quit_app, summary.downloads > 0 || summary.already_up_to_date);
         }
+        cached_pending_sync_badge = -1;
       }
       manual_filter_free(&xy);
     }

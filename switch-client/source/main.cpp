@@ -2104,11 +2104,17 @@ static void resolve_both_changed_conflict_switch(PadState* pad,
                                                  const std::string& plat,
                                                  const std::vector<LocalSave>& locals,
                                                  std::vector<std::string>& logs,
-                                                 std::vector<BaselineRow>& baseline) {
+                                                 std::vector<BaselineRow>& baseline,
+                                                 bool no_sync_history) {
   consoleClear();
   printf("\n  -------- Conflict --------\n\n  %s\n\n", id.c_str());
-  printf("  Local and server both changed since\n");
-  printf("  the last successful sync.\n\n");
+  if (no_sync_history) {
+    printf("  No sync history on this device yet.\n");
+    printf("  Choose which version to keep:\n\n");
+  } else {
+    printf("  Local and server both changed since\n");
+    printf("  the last successful sync.\n\n");
+  }
   printf("  X   Upload local (overwrite server)\n");
   printf("  Y   Download server (overwrite local)\n");
   printf("  B   Skip for now\n\n");
@@ -2634,7 +2640,7 @@ static std::vector<std::string> run_sync(
       std::string base_sha;
       if (!baseline_get_sha(baseline, id, &base_sha)) {
         if (pad) {
-          resolve_both_changed_conflict_switch(pad, cfg, id, l, r, plat, local, logs, baseline);
+          resolve_both_changed_conflict_switch(pad, cfg, id, l, r, plat, local, logs, baseline, true);
         } else {
           logs.push_back(id + ": SKIP (no baseline — need interactive resolution)");
         }
@@ -2649,7 +2655,7 @@ static std::vector<std::string> run_sync(
         if (put_save_log(cfg, l, false, plat, logs, &uploaded_sha)) baseline_upsert(baseline, id, uploaded_sha);
       } else if (!loc_eq && !rem_eq) {
         if (pad) {
-          resolve_both_changed_conflict_switch(pad, cfg, id, l, r, plat, local, logs, baseline);
+          resolve_both_changed_conflict_switch(pad, cfg, id, l, r, plat, local, logs, baseline, false);
         } else {
           logs.push_back(id + ": SKIP (both changed — need interactive resolution)");
         }
@@ -2776,6 +2782,8 @@ int main(int argc, char** argv) {
   } else if (cfg.server_url.rfind("http://", 0) != 0) {
     logs.push_back("ERROR: use http:// URL for Switch MVP");
   } else {
+    /* -1 = stale (recompute). Avoids full local scan + GET /saves on every menu draw. */
+    int cached_pending_sync_badge = -1;
     while (appletMainLoop() && !quit_app) {
       consoleClear();
       printf("GBAsync (Switch)\n");
@@ -2798,8 +2806,12 @@ int main(int argc, char** argv) {
       printf("\n");
       sync_status_print_menu(cfg);
       {
-        const int pend = count_pending_auto_sync_switch(cfg);
-        if (pend > 0) printf("  %d game(s) need sync (run Auto)\n\n", pend);
+        if (cached_pending_sync_badge < 0) {
+          cached_pending_sync_badge = count_pending_auto_sync_switch(cfg);
+        }
+        if (cached_pending_sync_badge > 0) {
+          printf("  %d game(s) need sync (run Auto)\n\n", cached_pending_sync_badge);
+        }
       }
       {
         constexpr int kMenuLeftCol = 20;
@@ -2824,6 +2836,7 @@ int main(int argc, char** argv) {
         sync_logs = run_dropbox_sync_once(cfg);
       } else if (action == SyncAction::SaveViewer) {
         save_viewer_switch(&pad, cfg);
+        cached_pending_sync_badge = -1;
         continue;
       } else if (action == SyncAction::UploadOnly) {
         if (!pick_upload_selection(&pad, cfg, &xy)) continue;
@@ -2840,10 +2853,12 @@ int main(int argc, char** argv) {
         } else {
           wait_after_sync_switch(&pad, &quit_app);
         }
+        cached_pending_sync_badge = -1;
         continue;
       }
       for (const auto& line : sync_logs) printf("%s\n", line.c_str());
       wait_after_sync_switch(&pad, &quit_app);
+      cached_pending_sync_badge = -1;
     }
   }
   for (const auto& line : logs) printf("%s\n", line.c_str());
